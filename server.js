@@ -213,7 +213,7 @@ app.post(["/api/users", "/monitoring/api/users"], authMiddleware, requireRole("a
     createdAt: new Date().toISOString(),
   });
   saveUsers(users);
-  res.json({ success: true, user: { username: newUser.username, role: newUser.role, displayName: newUser.displayName } });
+  res.json({ success: true, user: { username, role, displayName: displayName || username } });
 });
 
 // PUT update user (admin only)
@@ -267,6 +267,16 @@ const DEVICES = [
     password: process.env.MIKROTIK_2_PASS || "",
     timeout: 15,
     wanInterface: process.env.MIKROTIK_2_WAN || "",
+  },
+  {
+    id: "3",
+    name: process.env.MIKROTIK_3_NAME || "Router 3",
+    host: process.env.MIKROTIK_3_HOST || "127.0.0.1",
+    port: parseInt(process.env.MIKROTIK_3_PORT || "8728"),
+    user: process.env.MIKROTIK_3_USER || "admin",
+    password: process.env.MIKROTIK_3_PASS || "",
+    timeout: 15,
+    wanInterface: process.env.MIKROTIK_3_WAN || "",
   },
 ];
 

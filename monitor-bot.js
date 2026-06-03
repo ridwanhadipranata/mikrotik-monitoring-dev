@@ -22,6 +22,7 @@ const STATUS_FILE = path.join(DATA_DIR, "client-status.json");
 const DEVICES = [
   { id: "1", name: process.env.MIKROTIK_1_NAME || "Router 1", host: process.env.MIKROTIK_1_HOST || "127.0.0.1", port: parseInt(process.env.MIKROTIK_1_PORT || "8728"), user: process.env.MIKROTIK_1_USER || "admin", password: process.env.MIKROTIK_1_PASS || "", timeout: 10 },
   { id: "2", name: process.env.MIKROTIK_2_NAME || "Router 2", host: process.env.MIKROTIK_2_HOST || "127.0.0.1", port: parseInt(process.env.MIKROTIK_2_PORT || "8728"), user: process.env.MIKROTIK_2_USER || "admin", password: process.env.MIKROTIK_2_PASS || "", timeout: 15 },
+  { id: "3", name: process.env.MIKROTIK_3_NAME || "Router 3", host: process.env.MIKROTIK_3_HOST || "127.0.0.1", port: parseInt(process.env.MIKROTIK_3_PORT || "8728"), user: process.env.MIKROTIK_3_USER || "admin", password: process.env.MIKROTIK_3_PASS || "", timeout: 15 },
 ];
 
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });

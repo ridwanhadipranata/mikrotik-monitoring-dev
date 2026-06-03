@@ -224,12 +224,12 @@ export default function DashboardPage() {
           />
           <MetricCard
             title="Total Traffic"
-            value={formatBytes((totalRx + totalTx) / 8)}
+            value={formatBits(totalRx + totalTx)}
             subtitle="Current throughput"
             icon={<ArrowUpDown className="w-4 h-4" />}
             color="#0A84FF"
             trend="up"
-            trendValue={`${formatBytes(totalRx / 8)}/s ↓`}
+            trendValue={`${formatBits(totalRx)} ↓`}
           />
         </div>
 
@@ -319,7 +319,7 @@ export default function DashboardPage() {
                       Download
                     </p>
                     <p className="text-[18px] font-semibold text-[#0A84FF] font-mono">
-                      {formatBytes(iface.rxRate / 8)}/s
+                      {formatBits(iface.rxRate)}/s
                     </p>
                   </div>
                   <div>
@@ -327,7 +327,7 @@ export default function DashboardPage() {
                       Upload
                     </p>
                     <p className="text-[18px] font-semibold text-[#30D158] font-mono">
-                      {formatBytes(iface.txRate / 8)}/s
+                      {formatBits(iface.txRate)}/s
                     </p>
                   </div>
                 </div>
