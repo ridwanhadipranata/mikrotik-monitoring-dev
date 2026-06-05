@@ -11,13 +11,41 @@ require("dotenv").config();
 
 const waGateway = require("./wa-gateway");
 const { generateInvoiceText, generateAllUnpaidText } = require("./invoice-text-server");
+const { getPrisma, encrypt, decrypt } = require("./lib/db-server");
 
 const app = express();
+
+// ─── Auto-wrap async route handlers (catches promise rejections) ─
+const _wrapAsync = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+for (const method of ["get", "post", "put", "delete", "patch"]) {
+  const original = app[method].bind(app);
+  app[method] = (...args) => {
+    const handler = args[args.length - 1];
+    if (typeof handler === "function" && handler.constructor.name === "AsyncFunction") {
+      args[args.length - 1] = _wrapAsync(handler);
+    }
+    return original(...args);
+  };
+}
 
 // ─── Security Middleware ────────────────────────────────────────
 app.use(helmet({ contentSecurityPolicy: false, crossOriginEmbedderPolicy: false }));
 app.use(cors({ origin: process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(",") : ["http://localhost:3458", "http://localhost:3000"], credentials: true }));
 app.use(express.json({ limit: "2mb" }));
+
+// ─── Input Validation Helpers ───────────────────────────────────
+function isValidHost(host) {
+  return typeof host === "string" && host.length > 0 && host.length <= 255 && /^[\w.\-:]+$/.test(host);
+}
+function isValidPort(port) {
+  const p = Number(port);
+  return Number.isInteger(p) && p >= 1 && p <= 65535;
+}
+
+// ─── Rate Limiters ──────────────────────────────────────────────
+const testRouterLimiter = rateLimit({ windowMs: 60 * 1000, max: 10, message: { error: "Too many connection tests" } });
+const waLimiter = rateLimit({ windowMs: 60 * 1000, max: 30, message: { error: "Too many WhatsApp requests" } });
+const backupLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 5, message: { error: "Too many restore attempts" } });
 
 // ─── Rate Limiting ─────────────────────────────────────────────
 const loginLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 15, message: { error: "Terlalu banyak percobaan login. Coba lagi dalam 15 menit." } });
@@ -29,7 +57,6 @@ app.use("/api/", apiLimiter);
 const AUTH_SECRET = process.env.AUTH_SECRET;
 if (!AUTH_SECRET) { console.error("[FATAL] AUTH_SECRET not set in .env"); process.exit(1); }
 const BCRYPT_ROUNDS = 12;
-function getAuthUsers() { return loadUsers(); }
 const AUTH_TOKEN_EXPIRY = 24 * 60 * 60 * 1000; // 24 hours
 
 // Atomic file write helper
@@ -42,7 +69,7 @@ function atomicWrite(file, data) {
 function createAuthToken(user) {
   const header = Buffer.from(JSON.stringify({ alg: "HS256", typ: "JWT" })).toString("base64url");
   const payload = Buffer.from(
-    JSON.stringify({ sub: user.username, role: user.role, name: user.displayName, iat: Date.now(), exp: Date.now() + AUTH_TOKEN_EXPIRY })
+    JSON.stringify({ sub: user.username, role: user.role, name: user.displayName, tenantId: user.tenantId, iss: "mikromon", iat: Date.now(), exp: Date.now() + AUTH_TOKEN_EXPIRY })
   ).toString("base64url");
   const sig = crypto.createHmac("sha256", AUTH_SECRET).update(`${header}.${payload}`).digest("base64url");
   return `${header}.${payload}.${sig}`;
@@ -57,6 +84,7 @@ function verifyAuthToken(token) {
     if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expectedSig))) return null;
     const data = JSON.parse(Buffer.from(payload, "base64url").toString());
     if (data.exp < Date.now()) return null;
+    if (data.iss && data.iss !== "mikromon") return null;
     return data;
   } catch {
     return null;
@@ -80,7 +108,10 @@ function authMiddleware(req, res, next) {
 // Role-based access middleware
 function requireRole(...roles) {
   return (req, res, next) => {
-    if (!req.user || !roles.includes(req.user.role)) {
+    if (!req.user) return res.status(401).json({ error: "Not authenticated" });
+    // superadmin always has access
+    if (req.user.role === "superadmin") return next();
+    if (!roles.includes(req.user.role)) {
       return res.status(403).json({ error: "Access denied. Insufficient permissions." });
     }
     next();
@@ -95,25 +126,32 @@ app.post(["/api/auth/login", "/monitoring/api/auth/login"], loginLimiter, async 
     return res.status(400).json({ error: "Username and password are required" });
   }
 
-  const user = getAuthUsers().find((u) => u.username === username);
+  const prisma = getPrisma();
+  const user = await prisma.user.findUnique({ where: { username } });
   if (!user) return res.status(401).json({ error: "Username atau password salah" });
+
+  // Check if user is active
+  if (user.isActive === false) return res.status(403).json({ error: "Akun telah dinonaktifkan" });
+
+  // Check if tenant is active
+  const tenant = await prisma.tenant.findUnique({ where: { id: user.tenantId } });
+  if (!tenant || tenant.isActive === false) return res.status(403).json({ error: "Tenant telah dinonaktifkan" });
 
   // Support both bcrypt and legacy sha256 hashes
   let passwordValid = false;
   if (user.passwordHash.startsWith("$2b$")) {
     passwordValid = await bcrypt.compare(password, user.passwordHash);
   } else {
-    // Legacy sha256 — verify then migrate to bcrypt
     const shaHash = crypto.createHash("sha256").update(password).digest("hex");
-    passwordValid = shaHash === user.passwordHash;
+    passwordValid = crypto.timingSafeEqual(
+      Buffer.from(shaHash.padEnd(64, '0'), 'utf8'),
+      Buffer.from(user.passwordHash.padEnd(64, '0'), 'utf8')
+    );
     if (passwordValid) {
-      // Auto-migrate to bcrypt
-      const users = loadUsers();
-      const idx = users.findIndex(u => u.username === username);
-      if (idx !== -1) {
-        users[idx].passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
-        saveUsers(users);
-      }
+      await prisma.user.update({
+        where: { username },
+        data: { passwordHash: await bcrypt.hash(password, BCRYPT_ROUNDS) },
+      });
     }
   }
   if (!passwordValid) return res.status(401).json({ error: "Username atau password salah" });
@@ -122,7 +160,7 @@ app.post(["/api/auth/login", "/monitoring/api/auth/login"], loginLimiter, async 
 
   res.json({
     token,
-    user: { username: user.username, role: user.role, name: user.displayName },
+    user: { username: user.username, role: user.role, name: user.displayName, tenantId: user.tenantId },
     expiresIn: AUTH_TOKEN_EXPIRY,
   });
 });
@@ -141,7 +179,7 @@ app.get(["/api/auth/verify", "/monitoring/api/auth/verify"], (req, res) => {
     return res.status(401).json({ error: "Invalid or expired token" });
   }
 
-  res.json({ valid: true, user: { username: user.sub, role: user.role, name: user.name } });
+  res.json({ valid: true, user: { username: user.sub, role: user.role, name: user.name, tenantId: user.tenantId } });
 });
 
 // ─── API: Auth Logout (client-side, but we can log it) ──────────
@@ -149,136 +187,514 @@ app.post(["/api/auth/logout", "/monitoring/api/auth/logout"], (req, res) => {
   res.json({ success: true });
 });
 
-// ─── User Management ───────────────────────────────────────────
-const USERS_FILE = path.join(__dirname, "data", "users.json");
+// ─── User Management (Database) ────────────────────────────────
 
-function loadUsers() {
-  try {
-    if (fs.existsSync(USERS_FILE)) return JSON.parse(fs.readFileSync(USERS_FILE, "utf-8"));
-  } catch {}
-  return [];
-}
-
-function saveUsers(users) {
-  atomicWrite(USERS_FILE, users);
-}
-
-// Initialize users file with defaults if not exists
-if (!fs.existsSync(USERS_FILE)) {
-  const defaultUsers = [
-    { username: "amanna", password: "adminisp", role: "admin", displayName: "Amanna (Admin)" },
-    { username: "teknisi", password: "teknisi123", role: "teknisi", displayName: "Teknisi" },
-    { username: "pembayaran", password: "bayar123", role: "admin_pembayaran", displayName: "Admin Pembayaran" },
-  ];
-  const hashed = defaultUsers.map(u => ({
-    username: u.username,
-    passwordHash: bcrypt.hashSync(u.password, BCRYPT_ROUNDS),
-    role: u.role,
-    displayName: u.displayName,
-    createdAt: new Date().toISOString(),
-  }));
-  saveUsers(hashed);
-  console.log("[Auth] Created default users (CHANGE PASSWORDS IMMEDIATELY)");
-}
-
-// GET all users (admin only)
-app.get(["/api/users", "/monitoring/api/users"], authMiddleware, requireRole("admin"), (req, res) => {
-  const users = loadUsers().map(u => ({
-    username: u.username,
-    role: u.role,
-    displayName: u.displayName,
-    createdAt: u.createdAt,
-  }));
+// GET all users (admin only, tenant-scoped)
+app.get(["/api/users", "/monitoring/api/users"], authMiddleware, requireRole("admin"), async (req, res) => {
+  const prisma = getPrisma();
+  const users = await prisma.user.findMany({
+    where: { tenantId: req.user.tenantId },
+    select: { id: true, username: true, role: true, displayName: true, createdAt: true },
+    orderBy: { createdAt: "asc" },
+  });
   res.json(users);
 });
 
-// POST create user (admin only)
+// POST create user (admin only, same tenant)
 app.post(["/api/users", "/monitoring/api/users"], authMiddleware, requireRole("admin"), async (req, res) => {
   const { username, password, role, displayName } = req.body;
   if (!username || !password || !role) {
     return res.status(400).json({ error: "Username, password, dan role wajib diisi" });
   }
-  if (!["admin", "teknisi", "admin_pembayaran"].includes(role)) {
-    return res.status(400).json({ error: "Role tidak valid" });
+  if (!["admin", "staff"].includes(role)) {
+    return res.status(400).json({ error: "Role tidak valid. Gunakan: admin, staff" });
   }
-  const users = loadUsers();
-  if (users.find(u => u.username === username)) {
-    return res.status(400).json({ error: "Username sudah digunakan" });
-  }
-  users.push({
-    username,
-    passwordHash: await bcrypt.hash(password, BCRYPT_ROUNDS),
-    role,
-    displayName: displayName || username,
-    createdAt: new Date().toISOString(),
+  const prisma = getPrisma();
+  const existing = await prisma.user.findUnique({ where: { username } });
+  if (existing) return res.status(400).json({ error: "Username sudah digunakan" });
+
+  const user = await prisma.user.create({
+    data: {
+      tenantId: req.user.tenantId,
+      username,
+      passwordHash: await bcrypt.hash(password, BCRYPT_ROUNDS),
+      role,
+      displayName: displayName || username,
+    },
   });
-  saveUsers(users);
-  res.json({ success: true, user: { username, role, displayName: displayName || username } });
+  res.json({ success: true, user: { id: user.id, username: user.username, role: user.role, displayName: user.displayName } });
 });
 
-// PUT update user (admin only)
+// PUT update user (admin only, same tenant)
 app.put(["/api/users/:username", "/monitoring/api/users/:username"], authMiddleware, requireRole("admin"), async (req, res) => {
   const { username } = req.params;
   const { password, role, displayName } = req.body;
-  const users = loadUsers();
-  const idx = users.findIndex(u => u.username === username);
-  if (idx === -1) return res.status(404).json({ error: "User tidak ditemukan" });
-  if (role && !["admin", "teknisi", "admin_pembayaran"].includes(role)) {
-    return res.status(400).json({ error: "Role tidak valid" });
+  const prisma = getPrisma();
+
+  const user = await prisma.user.findFirst({
+    where: { username, tenantId: req.user.tenantId },
+  });
+  if (!user) return res.status(404).json({ error: "User tidak ditemukan" });
+
+  if (role && !["admin", "staff"].includes(role)) {
+    return res.status(400).json({ error: "Role tidak valid. Gunakan: admin, staff" });
   }
-  if (password) users[idx].passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
-  if (role) users[idx].role = role;
-  if (displayName) users[idx].displayName = displayName;
-  users[idx].updatedAt = new Date().toISOString();
-  saveUsers(users);
-  res.json({ success: true, user: { username: users[idx].username, role: users[idx].role, displayName: users[idx].displayName } });
+
+  const updateData = {};
+  if (password) updateData.passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
+  if (role) updateData.role = role;
+  if (displayName) updateData.displayName = displayName;
+
+  const updated = await prisma.user.update({
+    where: { id: user.id },
+    data: updateData,
+  });
+  res.json({ success: true, user: { username: updated.username, role: updated.role, displayName: updated.displayName } });
 });
 
-// DELETE user (admin only)
-app.delete(["/api/users/:username", "/monitoring/api/users/:username"], authMiddleware, requireRole("admin"), (req, res) => {
+// DELETE user (admin only, same tenant)
+app.delete(["/api/users/:username", "/monitoring/api/users/:username"], authMiddleware, requireRole("admin"), async (req, res) => {
   const { username } = req.params;
   if (username === "amanna") return res.status(400).json({ error: "Tidak bisa menghapus akun utama" });
-  let users = loadUsers();
-  const idx = users.findIndex(u => u.username === username);
-  if (idx === -1) return res.status(404).json({ error: "User tidak ditemukan" });
-  users.splice(idx, 1);
-  saveUsers(users);
+
+  const prisma = getPrisma();
+  const user = await prisma.user.findFirst({
+    where: { username, tenantId: req.user.tenantId },
+  });
+  if (!user) return res.status(404).json({ error: "User tidak ditemukan" });
+
+  await prisma.user.delete({ where: { id: user.id } });
   res.json({ success: true });
 });
 
-// ─── Mikrotik Config (Multi-Device) ────────────────────────────
-const DEVICES = [
-  {
-    id: "1",
-    name: process.env.MIKROTIK_1_NAME || "Router 1",
-    host: process.env.MIKROTIK_1_HOST || "127.0.0.1",
-    port: parseInt(process.env.MIKROTIK_1_PORT || "8728"),
-    user: process.env.MIKROTIK_1_USER || "admin",
-    password: process.env.MIKROTIK_1_PASS || "",
-    timeout: 10,
-    wanInterface: process.env.MIKROTIK_1_WAN || "",
-  },
-  {
-    id: "2",
-    name: process.env.MIKROTIK_2_NAME || "Router 2",
-    host: process.env.MIKROTIK_2_HOST || "127.0.0.1",
-    port: parseInt(process.env.MIKROTIK_2_PORT || "8728"),
-    user: process.env.MIKROTIK_2_USER || "admin",
-    password: process.env.MIKROTIK_2_PASS || "",
-    timeout: 15,
-    wanInterface: process.env.MIKROTIK_2_WAN || "",
-  },
-  {
-    id: "3",
-    name: process.env.MIKROTIK_3_NAME || "Router 3",
-    host: process.env.MIKROTIK_3_HOST || "127.0.0.1",
-    port: parseInt(process.env.MIKROTIK_3_PORT || "8728"),
-    user: process.env.MIKROTIK_3_USER || "admin",
-    password: process.env.MIKROTIK_3_PASS || "",
-    timeout: 15,
-    wanInterface: process.env.MIKROTIK_3_WAN || "",
-  },
+// ─── Tenant Management ──────────────────────────────────────────
+
+// GET current tenant info
+app.get(["/api/tenant", "/monitoring/api/tenant"], authMiddleware, async (req, res) => {
+  const prisma = getPrisma();
+  const tenant = await prisma.tenant.findUnique({
+    where: { id: req.user.tenantId },
+    include: { _count: { select: { users: true, routers: true, customers: true, invoices: true } } },
+  });
+  if (!tenant) return res.status(404).json({ error: "Tenant tidak ditemukan" });
+  res.json(tenant);
+});
+
+// GET all tenants (superadmin only)
+app.get(["/api/tenants", "/monitoring/api/tenants"], authMiddleware, requireRole("superadmin"), async (req, res) => {
+  const prisma = getPrisma();
+  const tenants = await prisma.tenant.findMany({
+    include: {
+      _count: {
+        select: {
+          users: true,
+          routers: { where: { isActive: true } },
+          customers: true,
+        },
+      },
+    },
+    orderBy: { createdAt: "asc" },
+  });
+  res.json(tenants);
+});
+
+// POST create tenant (superadmin only)
+app.post(["/api/tenants", "/monitoring/api/tenants"], authMiddleware, requireRole("superadmin"), async (req, res) => {
+  const { name, slug, description, adminUsername, adminPassword, adminDisplayName } = req.body;
+  if (!name || !slug) return res.status(400).json({ error: "Name and slug are required" });
+  if (!adminUsername || !adminPassword) return res.status(400).json({ error: "Admin username and password are required" });
+
+  const prisma = getPrisma();
+
+  // Check slug unique
+  const existingSlug = await prisma.tenant.findUnique({ where: { slug } });
+  if (existingSlug) return res.status(400).json({ error: "Slug sudah digunakan" });
+
+  // Check username unique
+  const existingUser = await prisma.user.findUnique({ where: { username: adminUsername } });
+  if (existingUser) return res.status(400).json({ error: "Username sudah digunakan" });
+
+  // Create tenant + admin user in transaction
+  const result = await prisma.$transaction(async (tx) => {
+    const tenant = await tx.tenant.create({
+      data: { name, slug, description },
+    });
+
+    const user = await tx.user.create({
+      data: {
+        tenantId: tenant.id,
+        username: adminUsername,
+        passwordHash: await bcrypt.hash(adminPassword, BCRYPT_ROUNDS),
+        role: "admin",
+        displayName: adminDisplayName || adminUsername,
+      },
+    });
+
+    return { tenant, user };
+  });
+
+  res.json({
+    success: true,
+    tenant: result.tenant,
+    adminUser: { username: result.user.username, role: result.user.role, displayName: result.user.displayName },
+  });
+});
+
+// PUT update tenant (superadmin only)
+app.put(["/api/tenants/:id", "/monitoring/api/tenants/:id"], authMiddleware, requireRole("superadmin"), async (req, res) => {
+  const { id } = req.params;
+  const { name, description, waNumber } = req.body;
+  const prisma = getPrisma();
+
+  const tenant = await prisma.tenant.findUnique({ where: { id } });
+  if (!tenant) return res.status(404).json({ error: "Tenant tidak ditemukan" });
+
+  const updateData = {};
+  if (name != null) updateData.name = name;
+  if (description != null) updateData.description = description;
+  if (waNumber !== undefined) updateData.waNumber = waNumber || null;
+
+  const updated = await prisma.tenant.update({ where: { id }, data: updateData });
+  res.json({ success: true, tenant: updated });
+});
+
+// DELETE tenant (superadmin only)
+app.delete(["/api/tenants/:id", "/monitoring/api/tenants/:id"], authMiddleware, requireRole("superadmin"), async (req, res) => {
+  const { id } = req.params;
+  const prisma = getPrisma();
+
+  const tenant = await prisma.tenant.findUnique({ where: { id } });
+  if (!tenant) return res.status(404).json({ error: "Tenant tidak ditemukan" });
+
+  // Check if tenant has active routers
+  const routerCount = await prisma.router.count({ where: { tenantId: id, isActive: true } });
+  if (routerCount > 0) return res.status(400).json({ error: `Tenant masih memiliki ${routerCount} router aktif. Hapus router terlebih dahulu.` });
+
+  // Soft delete: deactivate tenant and its users
+  await prisma.tenant.update({ where: { id }, data: { isActive: false } });
+  await prisma.user.updateMany({ where: { tenantId: id }, data: { isActive: false } });
+
+  console.log(`[DB] Tenant deactivated: ${tenant.name}`);
+  res.json({ success: true });
+});
+
+// GET users for a specific tenant (superadmin only)
+app.get(["/api/tenants/:id/users", "/monitoring/api/tenants/:id/users"], authMiddleware, requireRole("superadmin"), async (req, res) => {
+  const prisma = getPrisma();
+  const users = await prisma.user.findMany({
+    where: { tenantId: req.params.id },
+    select: { id: true, username: true, role: true, displayName: true, createdAt: true },
+    orderBy: { createdAt: "asc" },
+  });
+  res.json(users);
+});
+
+// POST create user for a specific tenant (superadmin only)
+app.post(["/api/tenants/:id/users", "/monitoring/api/tenants/:id/users"], authMiddleware, requireRole("superadmin"), async (req, res) => {
+  const { username, password, role, displayName } = req.body;
+  if (!username || !password) return res.status(400).json({ error: "Username and password are required" });
+
+  const prisma = getPrisma();
+  const tenant = await prisma.tenant.findUnique({ where: { id: req.params.id } });
+  if (!tenant) return res.status(404).json({ error: "Tenant tidak ditemukan" });
+
+  const existing = await prisma.user.findUnique({ where: { username } });
+  if (existing) return res.status(400).json({ error: "Username sudah digunakan" });
+
+  const user = await prisma.user.create({
+    data: {
+      tenantId: tenant.id,
+      username,
+      passwordHash: await bcrypt.hash(password, BCRYPT_ROUNDS),
+      role: role || "staff",
+      displayName: displayName || username,
+    },
+  });
+  res.json({ success: true, user: { id: user.id, username: user.username, role: user.role, displayName: user.displayName } });
+});
+
+// PUT update user for a specific tenant (superadmin only)
+app.put(["/api/tenants/:tenantId/users/:userId", "/monitoring/api/tenants/:tenantId/users/:userId"], authMiddleware, requireRole("superadmin"), async (req, res) => {
+  const { tenantId, userId } = req.params;
+  const { password, role, displayName } = req.body;
+  const prisma = getPrisma();
+
+  const user = await prisma.user.findFirst({ where: { id: userId, tenantId } });
+  if (!user) return res.status(404).json({ error: "User tidak ditemukan" });
+
+  const updateData = {};
+  if (password) updateData.passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
+  if (role) updateData.role = role;
+  if (displayName) updateData.displayName = displayName;
+
+  const updated = await prisma.user.update({ where: { id: userId }, data: updateData });
+  res.json({ success: true, user: { username: updated.username, role: updated.role, displayName: updated.displayName } });
+});
+
+// DELETE user for a specific tenant (superadmin only)
+app.delete(["/api/tenants/:tenantId/users/:userId", "/monitoring/api/tenants/:tenantId/users/:userId"], authMiddleware, requireRole("superadmin"), async (req, res) => {
+  const { tenantId, userId } = req.params;
+  const prisma = getPrisma();
+
+  const user = await prisma.user.findFirst({ where: { id: userId, tenantId } });
+  if (!user) return res.status(404).json({ error: "User tidak ditemukan" });
+
+  await prisma.user.delete({ where: { id: userId } });
+  res.json({ success: true });
+});
+
+// ─── Router Management (Database) ────────────────────────────────
+
+// In-memory router connections (keyed by router DB id)
+const routerConnections = new Map();
+
+// GET all routers for current tenant (or all routers for superadmin)
+app.get(["/api/routers", "/monitoring/api/routers"], authMiddleware, async (req, res) => {
+  const prisma = getPrisma();
+  const where = req.user.role === "superadmin" ? { isActive: true } : { tenantId: req.user.tenantId, isActive: true };
+
+  const routers = await prisma.router.findMany({
+    where,
+    include: { tenant: { select: { id: true, name: true, slug: true } } },
+    orderBy: { createdAt: "asc" },
+  });
+  // Add connection state (use connectionStates which is updated by withMikrotik)
+  const result = routers.map(r => {
+    const state = connectionStates[r.id] || { status: "disconnected", latency: 0, lastConnected: null };
+    return { ...r, status: state.status, latency: state.latency, lastConnected: state.lastConnected };
+  });
+  res.json(result);
+});
+
+// POST create router
+app.post(["/api/routers", "/monitoring/api/routers"], authMiddleware, requireRole("admin"), async (req, res) => {
+  try {
+    const { name, host, port, user, password, wanInterface, timeout } = req.body;
+    if (!name || !host) return res.status(400).json({ error: "Name and host are required" });
+    if (!isValidHost(host)) return res.status(400).json({ error: "Invalid host format" });
+    if (port && !isValidPort(port)) return res.status(400).json({ error: "Invalid port" });
+    if (name.length > 100) return res.status(400).json({ error: "Name too long" });
+    const prisma = getPrisma();
+
+    const tenant = await prisma.tenant.findUnique({ where: { id: req.user.tenantId } });
+    if (!tenant) return res.status(400).json({ error: "Sesi expired. Silakan logout dan login ulang." });
+
+    const router = await prisma.router.create({
+      data: {
+        tenantId: req.user.tenantId,
+        name,
+        host,
+        port: port || 8728,
+        user: user || "admin",
+        password: encrypt(password || ""),
+        wanInterface: wanInterface || null,
+        timeout: timeout || 20,
+      },
+    });
+
+    // Tambahkan ke DEVICES array dan langsung koneksi
+    DEVICES.push({
+      id: router.id,
+      name: router.name,
+      host: router.host,
+      port: router.port,
+      user: router.user,
+      password: password || "",
+      timeout: router.timeout,
+      wanInterface: router.wanInterface || "",
+    });
+    ensureConnectionState(router.id);
+    console.log(`[DB] Router added: ${router.name} (${router.host})`);
+
+    res.json({ success: true, router: { id: router.id, name: router.name, host: router.host } });
+  } catch (err) {
+    console.error("[API] Router create error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST test router connection (before saving)
+app.post(["/api/routers/test", "/monitoring/api/routers/test"], testRouterLimiter, authMiddleware, requireRole("admin", "superadmin"), async (req, res) => {
+  const { host, port, user, password, timeout } = req.body;
+  if (!host) return res.status(400).json({ error: "Host is required" });
+  if (!isValidHost(host)) return res.status(400).json({ error: "Invalid host format" });
+  if (port && !isValidPort(port)) return res.status(400).json({ error: "Invalid port" });
+
+  const routerPort = port || 8728;
+  const testTimeout = 5000; // 5 detik max
+
+  const testApi = new RouterOSAPI({
+    host,
+    port: routerPort,
+    user: user || "admin",
+    password: password || "",
+    timeout: testTimeout,
+  });
+
+  try {
+    await testApi.connect();
+
+    let identity = "Mikrotik";
+    try {
+      const idRes = await testApi.write("/system/identity/print");
+      if (idRes && idRes.length > 0) identity = idRes[0].name || "Mikrotik";
+    } catch {}
+
+    let version = "Unknown";
+    try {
+      const verRes = await testApi.write("/system/resource/print");
+      if (verRes && verRes.length > 0) version = verRes[0].version || "Unknown";
+    } catch {}
+
+    testApi.close();
+
+    // Get interfaces
+    let interfaces = [];
+    try {
+      const ifApi = new RouterOSAPI({ host, port: routerPort, user: user || "admin", password: password || "", timeout: testTimeout });
+      await ifApi.connect();
+      const ifRes = await ifApi.write("/interface/print");
+      interfaces = (ifRes || []).filter(i => i.disabled !== "true").map(i => ({
+        name: i.name || "",
+        type: i.type || "unknown",
+        running: i.running === "true",
+      }));
+      ifApi.close();
+    } catch {}
+
+    res.json({
+      success: true,
+      message: `Koneksi berhasil ke ${identity}`,
+      info: { identity, version, host, port: routerPort },
+      interfaces,
+    });
+  } catch (err) {
+    const errMsg = err.message || String(err);
+    let errorMsg = "";
+
+    if (errMsg.includes("ECONNREFUSED")) {
+      errorMsg = `Port API ${routerPort} tidak aktif di ${host}. Pastikan API enabled: /ip service set api address=0.0.0.0/0`;
+    } else if (errMsg.includes("ENOTFOUND") || errMsg.includes("getaddrinfo")) {
+      errorMsg = `IP/Host ${host} tidak ditemukan. Periksa alamat IP router.`;
+    } else if (errMsg.includes("ENETUNREACH") || errMsg.includes("EHOSTUNREACH")) {
+      errorMsg = `Jaringan tidak terjangkau ke ${host}. Periksa koneksi jaringan.`;
+    } else if (errMsg.includes("ETIMEDOUT") || errMsg.includes("timeout") || errMsg.includes("Timeout")) {
+      errorMsg = `Koneksi timeout ke ${host}:${routerPort}. Router tidak merespon dalam 5 detik.`;
+    } else if (errMsg.includes("ECONNRESET")) {
+      errorMsg = `Koneksi ditolak oleh ${host}. Firewall memblokir port ${routerPort}.`;
+    } else if (errMsg.includes("login") || errMsg.includes("password") || errMsg.includes("auth")) {
+      errorMsg = `Username atau password salah. Periksa kredensial API Mikrotik.`;
+    } else if (errMsg.includes("socket hang up") || errMsg.includes("closed")) {
+      errorMsg = `Koneksi ditutup oleh ${host}. Port ${routerPort} benar? API service aktif?`;
+    } else if (errMsg.includes("RosException") || errMsg.includes("Error")) {
+      errorMsg = `Gagal terhubung ke ${host}:${routerPort}. Periksa IP, port, dan kredensial.`;
+    } else {
+      errorMsg = `Gagal terhubung ke ${host}:${routerPort} — ${errMsg}`;
+    }
+
+    res.status(400).json({ success: false, error: errorMsg });
+  }
+});
+
+// PUT update router
+app.put(["/api/routers/:id", "/monitoring/api/routers/:id"], authMiddleware, requireRole("admin"), async (req, res) => {
+  const { id } = req.params;
+  const { name, host, port, user, password, wanInterface, timeout, isActive } = req.body;
+  const prisma = getPrisma();
+
+  const router = await prisma.router.findFirst({ where: { id, tenantId: req.user.tenantId } });
+  if (!router) return res.status(404).json({ error: "Router tidak ditemukan" });
+
+  const updateData = {};
+  if (name != null) updateData.name = name;
+  if (host != null) updateData.host = host;
+  if (port != null) updateData.port = port;
+  if (user != null) updateData.user = user;
+  if (password != null) updateData.password = encrypt(password);
+  if (wanInterface != null) updateData.wanInterface = wanInterface;
+  if (timeout != null) updateData.timeout = timeout;
+  if (isActive != null) updateData.isActive = isActive;
+
+  // Close existing connection if host/port changed
+  if (host || port || password) {
+    const conn = routerConnections.get(id);
+    if (conn) { try { conn.api.close(); } catch {} routerConnections.delete(id); }
+  }
+
+  const updated = await prisma.router.update({ where: { id }, data: updateData });
+  res.json({ success: true, router: { id: updated.id, name: updated.name, host: updated.host } });
+});
+
+// DELETE router
+app.delete(["/api/routers/:id", "/monitoring/api/routers/:id"], authMiddleware, requireRole("admin"), async (req, res) => {
+  const { id } = req.params;
+  const prisma = getPrisma();
+  const where = req.user.role === "superadmin" ? { id } : { id, tenantId: req.user.tenantId };
+  const router = await prisma.router.findFirst({ where });
+  if (!router) return res.status(404).json({ error: "Router tidak ditemukan" });
+
+  // Close connection
+  const conn = routerConnections.get(id);
+  if (conn) { try { conn.api.close(); } catch {} routerConnections.delete(id); }
+  apiConnections.delete(id);
+
+  // Hapus dari DEVICES array
+  const idx = DEVICES.findIndex(d => d.id === id);
+  if (idx !== -1) DEVICES.splice(idx, 1);
+
+  // Cleanup in-memory state
+  delete connectionStates[id];
+  delete pingCache[id];
+  delete mrtgRealtime[id];
+  for (const interval of Object.keys(mrtgIntervals)) {
+    delete mrtgIntervals[interval][id];
+  }
+
+  await prisma.router.update({ where: { id }, data: { isActive: false } });
+  console.log(`[DB] Router removed: ${router.name} (${router.host})`);
+  res.json({ success: true });
+});
+
+// ─── Dynamic Device Resolution ────────────────────────────────
+// Legacy DEVICES array (fallback for env-based routers)
+const LEGACY_DEVICES = [
+  { id: "1", name: process.env.MIKROTIK_1_NAME || "Router 1", host: process.env.MIKROTIK_1_HOST || "127.0.0.1", port: parseInt(process.env.MIKROTIK_1_PORT || "8728"), user: process.env.MIKROTIK_1_USER || "admin", password: process.env.MIKROTIK_1_PASS || "", timeout: 20, wanInterface: process.env.MIKROTIK_1_WAN || "" },
+  { id: "2", name: process.env.MIKROTIK_2_NAME || "Router 2", host: process.env.MIKROTIK_2_HOST || "127.0.0.1", port: parseInt(process.env.MIKROTIK_2_PORT || "8728"), user: process.env.MIKROTIK_2_USER || "admin", password: process.env.MIKROTIK_2_PASS || "", timeout: 15, wanInterface: process.env.MIKROTIK_2_WAN || "" },
+  { id: "3", name: process.env.MIKROTIK_3_NAME || "Router 3", host: process.env.MIKROTIK_3_HOST || "127.0.0.1", port: parseInt(process.env.MIKROTIK_3_PORT || "8728"), user: process.env.MIKROTIK_3_USER || "admin", password: process.env.MIKROTIK_3_PASS || "", timeout: 15, wanInterface: process.env.MIKROTIK_3_WAN || "" },
 ];
+
+const DEVICES = LEGACY_DEVICES;
+
+// ─── Sync DB routers to DEVICES array ───────────────────────────
+async function syncRoutersFromDB() {
+  try {
+    const prisma = getPrisma();
+    const dbRouters = await prisma.router.findMany({ where: { isActive: true } });
+    if (dbRouters.length === 0) return; // keep legacy devices
+
+    // Replace DEVICES with DB routers
+    DEVICES.length = 0;
+    for (const r of dbRouters) {
+      DEVICES.push({
+        id: r.id,
+        name: r.name,
+        host: r.host,
+        port: r.port,
+        user: r.user,
+        password: decrypt(r.password),
+        timeout: r.timeout,
+        wanInterface: r.wanInterface || "",
+      });
+      ensureConnectionState(r.id);
+    }
+    console.log(`[DB] Synced ${DEVICES.length} routers from database`);
+  } catch (err) {
+    console.error("[DB] Router sync error:", err.message);
+  }
+}
+
+// Sync on startup
+syncRoutersFromDB().catch(e => console.error("[DB] Init sync error:", e.message));
 
 // ─── MRTG Data Collector ────────────────────────────────────────
 const MRTG_DIR = path.join(__dirname, "mrtg-data");
@@ -387,75 +803,148 @@ function getDevice(deviceId) {
 
 // ─── Connection State (per device) ──────────────────────────────
 const connectionStates = {};
+function ensureConnectionState(deviceId) {
+  if (!connectionStates[deviceId]) {
+    connectionStates[deviceId] = {
+      status: "disconnected",
+      latency: 0,
+      lastError: null,
+      reconnects: 0,
+      lastConnected: null,
+    };
+  }
+  return connectionStates[deviceId];
+}
 for (const d of DEVICES) {
-  connectionStates[d.id] = {
-    status: "disconnected",
-    latency: 0,
-    lastError: null,
-    reconnects: 0,
-    lastConnected: null,
-  };
+  ensureConnectionState(d.id);
 }
 
 // ─── Fresh Connection Helper ────────────────────────────────────
+// ── Persistent Connection Pool ──────────────────────────────────
+const apiConnections = new Map(); // deviceId → { api, connected }
+
 async function withMikrotik(deviceId, fn) {
   const device = getDevice(deviceId);
-  const state = connectionStates[device.id];
+  const state = ensureConnectionState(device.id);
 
+  // Reuse existing connection
+  const existing = apiConnections.get(device.id);
+  if (existing && existing.connected) {
+    try {
+      const result = await fn(existing.api);
+      state.status = "connected";
+      state.lastConnected = new Date().toISOString();
+      return result;
+    } catch (err) {
+      // Connection might be stale, reconnect
+      console.log(`[API] Connection stale for ${device.name}, reconnecting...`);
+      existing.connected = false;
+      try { existing.api.close(); } catch {}
+    }
+  }
+
+  // Create new connection
+  console.log(`[API] New connection to ${device.name}`);
   const api = new RouterOSAPI({
     host: device.host,
     port: device.port,
     user: device.user,
     password: device.password,
     timeout: device.timeout,
+    keepalive: true,
   });
 
   try {
     await api.connect();
+    apiConnections.set(device.id, { api, connected: true });
     state.status = "connected";
     state.reconnects++;
     state.lastConnected = new Date().toISOString();
     state.lastError = null;
 
     const result = await fn(api);
-    api.close();
     return result;
   } catch (err) {
     state.status = "error";
     state.lastError = err.message;
+    apiConnections.delete(device.id);
     try { api.close(); } catch {}
     throw err;
   }
 }
 
+// ─── Connection Health Check (every 60s) ───────────────────────
+async function checkConnections() {
+  for (const device of DEVICES) {
+    const conn = apiConnections.get(device.id);
+    if (!conn || !conn.connected) continue;
+    try {
+      await conn.api.write("/system/identity/print");
+    } catch (err) {
+      console.log(`[API] Health check failed for ${device.name}: ${err.message}`);
+      conn.connected = false;
+      try { conn.api.close(); } catch {}
+      apiConnections.delete(device.id);
+      const state = connectionStates[device.id];
+      if (state) {
+        state.status = "disconnected";
+        state.lastError = "Health check failed: " + err.message;
+      }
+    }
+  }
+}
+setInterval(checkConnections, 60000);
+
 // Helper to extract device ID from query param
 function deviceId(req) {
   const did = req.query.device || req.query.deviceId || DEVICES[0].id;
-  // Validate against known device IDs
   const validIds = new Set(DEVICES.map(d => d.id));
   return validIds.has(String(did)) ? String(did) : DEVICES[0].id;
 }
 
+// Check if device belongs to tenant
+async function assertDeviceAccess(req, res, did) {
+  if (req.user.role === "superadmin") return true;
+  const prisma = getPrisma();
+  const router = await prisma.router.findFirst({ where: { id: did, tenantId: req.user.tenantId, isActive: true } });
+  if (!router) {
+    res.status(403).json({ error: "Access denied. Router not in your tenant." });
+    return false;
+  }
+  return true;
+}
+
 // ─── API: Device List ──────────────────────────────────────────
-app.get(["/api/devices", "/monitoring/api/devices"], (req, res) => {
-  const devices = DEVICES.map((d) => {
-    const state = connectionStates[d.id];
+app.get(["/api/devices", "/monitoring/api/devices"], authMiddleware, async (req, res) => {
+  const prisma = getPrisma();
+  const where = req.user.role === "superadmin" ? { isActive: true } : { tenantId: req.user.tenantId, isActive: true };
+
+  const dbRouters = await prisma.router.findMany({
+    where,
+    include: { tenant: { select: { id: true, name: true, slug: true } } },
+  });
+
+  const devices = dbRouters.map((r) => {
+    const state = connectionStates[r.id] || { status: "disconnected", latency: 0, lastConnected: null };
     return {
-      id: d.id,
-      name: d.name,
-      host: d.host,
-      port: d.port,
+      id: r.id,
+      name: r.name,
+      host: r.host,
+      port: r.port,
+      wanInterface: r.wanInterface || null,
       status: state.status === "connected" ? "online" : state.status === "error" ? "offline" : "connecting",
       lastSeen: state.lastConnected ? new Date(state.lastConnected) : null,
+      tenant: r.tenant,
     };
   });
   res.json(devices);
 });
 
 // ─── API: Health Check ──────────────────────────────────────────
-app.get(["/api/ping", "/monitoring/api/ping"], async (req, res) => {
+app.get(["/api/ping", "/monitoring/api/ping"], authMiddleware, async (req, res) => {
   try {
     const did = deviceId(req);
+    if (!(await assertDeviceAccess(req, res, did))) return;
     const start = Date.now();
     await withMikrotik(did, async (api) => {
       await api.write("/system/identity/print");
@@ -469,15 +958,17 @@ app.get(["/api/ping", "/monitoring/api/ping"], async (req, res) => {
 });
 
 // ─── API: Connection State ──────────────────────────────────────
-app.get(["/api/connection", "/monitoring/api/connection"], (req, res) => {
+app.get(["/api/connection", "/monitoring/api/connection"], authMiddleware, async (req, res) => {
   const did = deviceId(req);
+  if (!(await assertDeviceAccess(req, res, did))) return;
   res.json({ device: did, ...connectionStates[did] });
 });
 
 // ─── API: System Resource ───────────────────────────────────────
-app.get(["/api/resource", "/monitoring/api/resource"], async (req, res) => {
+app.get(["/api/resource", "/monitoring/api/resource"], authMiddleware, async (req, res) => {
   try {
     const did = deviceId(req);
+    if (!(await assertDeviceAccess(req, res, did))) return;
     const data = await withMikrotik(did, async (api) => {
       const resource = await api.write("/system/resource/print");
       if (!resource || resource.length === 0) throw new Error("Empty response");
@@ -549,9 +1040,10 @@ app.get(["/api/resource", "/monitoring/api/resource"], async (req, res) => {
 });
 
 // ─── API: Interfaces ────────────────────────────────────────────
-app.get(["/api/interfaces", "/monitoring/api/interfaces"], async (req, res) => {
+app.get(["/api/interfaces", "/monitoring/api/interfaces"], authMiddleware, async (req, res) => {
   try {
     const did = deviceId(req);
+    if (!(await assertDeviceAccess(req, res, did))) return;
     const data = await withMikrotik(did, async (api) => {
       const interfaces = await api.write("/interface/print");
 
@@ -612,9 +1104,10 @@ app.get(["/api/interfaces", "/monitoring/api/interfaces"], async (req, res) => {
 });
 
 // ─── API: Firewall ──────────────────────────────────────────────
-app.get(["/api/firewall", "/monitoring/api/firewall"], async (req, res) => {
+app.get(["/api/firewall", "/monitoring/api/firewall"], authMiddleware, async (req, res) => {
   try {
     const did = deviceId(req);
+    if (!(await assertDeviceAccess(req, res, did))) return;
     const data = await withMikrotik(did, async (api) => {
       const rules = await api.write("/ip/firewall/filter/print");
       const natRules = await api.write("/ip/firewall/nat/print");
@@ -641,9 +1134,10 @@ app.get(["/api/firewall", "/monitoring/api/firewall"], async (req, res) => {
 });
 
 // ─── API: DHCP Leases ───────────────────────────────────────────
-app.get(["/api/dhcp", "/monitoring/api/dhcp"], async (req, res) => {
+app.get(["/api/dhcp", "/monitoring/api/dhcp"], authMiddleware, async (req, res) => {
   try {
     const did = deviceId(req);
+    if (!(await assertDeviceAccess(req, res, did))) return;
     const data = await withMikrotik(did, async (api) => {
       const leases = await api.write("/ip/dhcp-server/lease/print");
       return {
@@ -666,9 +1160,10 @@ app.get(["/api/dhcp", "/monitoring/api/dhcp"], async (req, res) => {
 });
 
 // ─── API: Active Connections ────────────────────────────────────
-app.get(["/api/connections", "/monitoring/api/connections"], async (req, res) => {
+app.get(["/api/connections", "/monitoring/api/connections"], authMiddleware, async (req, res) => {
   try {
     const did = deviceId(req);
+    if (!(await assertDeviceAccess(req, res, did))) return;
     const data = await withMikrotik(did, async (api) => {
       const connections = await api.write("/ip/firewall/connection/print");
       return { count: connections ? connections.length : 0 };
@@ -680,7 +1175,7 @@ app.get(["/api/connections", "/monitoring/api/connections"], async (req, res) =>
 });
 
 // ─── Ping via Mikrotik Router ──────────────────────────────────
-async function mikrotikPing(api, ips, concurrency = 20) {
+async function mikrotikPing(api, ips, concurrency = 100) {
   const results = {};
   for (let i = 0; i < ips.length; i += concurrency) {
     const batch = ips.slice(i, i + concurrency);
@@ -702,22 +1197,28 @@ async function mikrotikPing(api, ips, concurrency = 20) {
       }
     });
     await Promise.all(promises);
-    // Small delay between batches to avoid overwhelming the router API
-    if (i + concurrency < ips.length) {
-      await new Promise(r => setTimeout(r, 100));
-    }
+    // No delay - fast ping
   }
   return results;
 }
 
 // ─── Ping Cache (heavy - pings 700+ IPs via router) ────────────
-const pingCache = {};
-const PING_CACHE_TTL = 55000; // 55 seconds
+// ─── Bot Status Cache (read from monitor-bot data) ────────────
+const BOT_STATUS_FILE = path.join(__dirname, "data", "client-status.json");
+function getBotStatus() {
+  try {
+    if (fs.existsSync(BOT_STATUS_FILE)) {
+      return JSON.parse(fs.readFileSync(BOT_STATUS_FILE, "utf-8"));
+    }
+  } catch {}
+  return {};
+}
 
 // ─── API: Client Queue Data (lightweight, no ping) ──────────────
-app.get(["/api/clients", "/monitoring/api/clients"], async (req, res) => {
+app.get(["/api/clients", "/monitoring/api/clients"], authMiddleware, async (req, res) => {
   try {
     const did = deviceId(req);
+    if (!(await assertDeviceAccess(req, res, did))) return;
     const data = await withMikrotik(did, async (api) => {
       const queues = await api.write("/queue/simple/print");
       const clients = (queues || []).map((q) => {
@@ -744,15 +1245,15 @@ app.get(["/api/clients", "/monitoring/api/clients"], async (req, res) => {
         };
       });
 
-      // Merge with cached ping data if available
-      const cachedPing = pingCache[did];
-      const pingResults = cachedPing ? cachedPing.data : {};
+      // Merge with bot status data (single source of truth)
+      const botStatus = getBotStatus();
 
       const merged = clients.map(c => {
-        const clientPings = c.ips.map(ip => pingResults[ip] || { ip, alive: false, latency: null });
-        const alive = clientPings.some(p => p.alive);
-        const latency = clientPings.find(p => p.alive)?.latency ?? null;
-        return { ...c, alive, latency, pings: clientPings };
+        const key = `${did}:${c.name}`;
+        const entry = botStatus[key];
+        const alive = entry ? entry.status === "up" : false;
+        const latency = entry?.latency ?? null;
+        return { ...c, alive, latency };
       });
 
       const up = merged.filter(c => c.alive && !c.disabled);
@@ -776,38 +1277,39 @@ app.get(["/api/clients", "/monitoring/api/clients"], async (req, res) => {
   }
 });
 
-// ─── API: Client Ping (heavy - router pings all IPs) ────────────
-app.get(["/api/clients/ping", "/monitoring/api/clients/ping"], async (req, res) => {
+// ─── API: Client Ping (reads from bot data — lightweight) ─────
+app.get(["/api/clients/ping", "/monitoring/api/clients/ping"], authMiddleware, async (req, res) => {
   try {
     const did = deviceId(req);
+    if (!(await assertDeviceAccess(req, res, did))) return;
 
-    // Check cache
-    const cached = pingCache[did];
-    if (cached && Date.now() - cached.time < PING_CACHE_TTL) {
-      return res.json({ cached: true, results: cached.data, cachedAt: cached.time });
+    // Read from bot status (single source of truth)
+    const botStatus = getBotStatus();
+    const results = {};
+
+    for (const [key, entry] of Object.entries(botStatus)) {
+      if (key.startsWith(did + ":")) {
+        // Extract client name from key
+        const name = key.slice(did.length + 1);
+        // Find IPs from queue data (we need to map name → IPs)
+        // For now, return status by name
+        results[name] = {
+          status: entry.status,
+          latency: entry.latency,
+          changedAt: entry.changedAt,
+        };
+      }
     }
 
-    const results = await withMikrotik(did, async (api) => {
-      const queues = await api.write("/queue/simple/print");
-      const allIps = [...new Set((queues || []).flatMap(q => {
-        return (q.target || "").split(",").map(t => t.trim().split("/")[0].trim()).filter(ip => ip && !ip.endsWith(".0"));
-      }))];
-
-      return await mikrotikPing(api, allIps, 20);
-    });
-
-    // Store in cache
-    pingCache[did] = { data: results, time: Date.now() };
-
-    res.json({ cached: false, results, cachedAt: Date.now() });
+    res.json({ results, source: "bot", cachedAt: Date.now() });
   } catch (err) {
     console.error("[API] Clients ping error:", err.message);
-    res.status(500).json({ error: "Failed to ping clients" });
+    res.status(500).json({ error: "Failed to get ping data" });
   }
 });
 
 // ─── API: Client Status Log (from monitor-bot) ────────────────────
-app.get(["/api/status-log", "/monitoring/api/status-log"], (req, res) => {
+app.get(["/api/status-log", "/monitoring/api/status-log"], authMiddleware, async (req, res) => {
   try {
     const statusFile = path.join(__dirname, "data", "client-status.json");
     const logFile = path.join(__dirname, "data", "status-log.json");
@@ -820,8 +1322,9 @@ app.get(["/api/status-log", "/monitoring/api/status-log"], (req, res) => {
 });
 
 // ─── API: MRTG Traffic Data ─────────────────────────────────────
-app.get(["/api/mrtg", "/monitoring/api/mrtg"], (req, res) => {
+app.get(["/api/mrtg", "/monitoring/api/mrtg"], authMiddleware, async (req, res) => {
   const did = deviceId(req);
+  if (!(await assertDeviceAccess(req, res, did))) return;
   const range = req.query.range || "realtime";
 
   const device = getDevice(did);
@@ -852,9 +1355,10 @@ app.get(["/api/mrtg", "/monitoring/api/mrtg"], (req, res) => {
 });
 
 // ─── API: WAN Interface Traffic (realtime for dashboard) ─────────
-app.get(["/api/wan-traffic", "/monitoring/api/wan-traffic"], async (req, res) => {
+app.get(["/api/wan-traffic", "/monitoring/api/wan-traffic"], authMiddleware, async (req, res) => {
   try {
     const did = deviceId(req);
+    if (!(await assertDeviceAccess(req, res, did))) return;
     const device = getDevice(did);
     if (!device.wanInterface) {
       return res.json({ interface: null, rx: 0, tx: 0 });
@@ -887,79 +1391,67 @@ app.get(["/api/wan-traffic", "/monitoring/api/wan-traffic"], async (req, res) =>
 });
 
 // ═══════════════════════════════════════════════════════════════
-// BILLING SYSTEM
+// BILLING SYSTEM (Database-backed)
 // ═══════════════════════════════════════════════════════════════
-const BILLING_DIR = path.join(__dirname, "billing-data");
-if (!fs.existsSync(BILLING_DIR)) fs.mkdirSync(BILLING_DIR, { recursive: true });
+const billingDb = require("./lib/billing-db");
 
-function billingFile(name) {
-  return path.join(BILLING_DIR, `${name}.json`);
-}
-
-function loadBillingData(name) {
-  try {
-    const file = billingFile(name);
-    if (fs.existsSync(file)) return JSON.parse(fs.readFileSync(file, "utf-8"));
-  } catch {}
-  return [];
-}
-
-function saveBillingData(name, data) {
-  atomicWrite(billingFile(name), data);
-}
-
-function genId() {
-  return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-}
-
-// Helper: get device filter
-function billingDeviceId(req) {
-  return req.query.deviceId || req.query.device || req.body?.deviceId || DEVICES[0].id;
-}
-
-function filterByDevice(data, did) {
-  return data.filter(d => d.deviceId === did);
+// Helper: superadmin sees all tenants, others scoped to their tenant
+function billingTenantId(req) {
+  return req.user.role === "superadmin" ? null : req.user.tenantId;
 }
 
 // ── Packages CRUD ─────────────────────────────────────────────
-app.get(["/api/billing/packages", "/monitoring/api/billing/packages"], authMiddleware, requireRole("admin", "admin_pembayaran"), (req, res) => {
-  const did = billingDeviceId(req);
-  const all = loadBillingData("packages");
-  res.json(filterByDevice(all, did));
+app.get(["/api/billing/packages", "/monitoring/api/billing/packages"], authMiddleware, requireRole("admin", "staff"), async (req, res) => {
+  try {
+    const did = req.query.deviceId || req.query.device || null;
+    const packages = await billingDb.getPackages(billingTenantId(req), did);
+    res.json(packages);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-app.post(["/api/billing/packages", "/monitoring/api/billing/packages"], authMiddleware, requireRole("admin", "admin_pembayaran"), (req, res) => {
-  const { name, speedUp, speedDown, price, description, deviceId: did } = req.body;
-  if (!name || price == null) return res.status(400).json({ error: "Name and price are required" });
-  const packages = loadBillingData("packages");
-  const pkg = { id: genId(), deviceId: did || DEVICES[0].id, name, speedUp: speedUp || "", speedDown: speedDown || "", price: Number(price), description: description || "", createdAt: new Date().toISOString() };
-  packages.push(pkg);
-  saveBillingData("packages", packages);
-  res.json(pkg);
+app.post(["/api/billing/packages", "/monitoring/api/billing/packages"], authMiddleware, requireRole("admin"), async (req, res) => {
+  try {
+    const { name, speedUp, speedDown, price, description, tenantId: targetTenantId, deviceId: did } = req.body;
+    if (!name || price == null) return res.status(400).json({ error: "Name and price are required" });
+    // For superadmin, allow specifying tenantId; otherwise use own tenant
+    let tenantId = req.user.tenantId;
+    if (req.user.role === "superadmin" && targetTenantId) {
+      tenantId = targetTenantId;
+    }
+    const pkg = await billingDb.createPackage(tenantId, { name, speedUp, speedDown, price, description, routerId: did });
+    res.json(pkg);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
 });
 
-app.put(["/api/billing/packages/:id", "/monitoring/api/billing/packages/:id"], authMiddleware, requireRole("admin", "admin_pembayaran"), (req, res) => {
-  const packages = loadBillingData("packages");
-  const idx = packages.findIndex(p => p.id === req.params.id);
-  if (idx === -1) return res.status(404).json({ error: "Package not found" });
-  const { name, speedUp, speedDown, price, description } = req.body;
-  packages[idx] = { ...packages[idx], ...(name != null && { name }), ...(speedUp != null && { speedUp }), ...(speedDown != null && { speedDown }), ...(price != null && { price: Number(price) }), ...(description != null && { description }) };
-  saveBillingData("packages", packages);
-  res.json(packages[idx]);
+app.put(["/api/billing/packages/:id", "/monitoring/api/billing/packages/:id"], authMiddleware, requireRole("admin"), async (req, res) => {
+  try {
+    const { name, speedUp, speedDown, price, description } = req.body;
+    const pkg = await billingDb.updatePackage(req.params.id, billingTenantId(req), { name, speedUp, speedDown, price, description });
+    res.json(pkg);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
 });
 
-app.delete(["/api/billing/packages/:id", "/monitoring/api/billing/packages/:id"], authMiddleware, requireRole("admin", "admin_pembayaran"), (req, res) => {
-  let packages = loadBillingData("packages");
-  packages = packages.filter(p => p.id !== req.params.id);
-  saveBillingData("packages", packages);
-  res.json({ success: true });
+app.delete(["/api/billing/packages/:id", "/monitoring/api/billing/packages/:id"], authMiddleware, requireRole("admin"), async (req, res) => {
+  try {
+    await billingDb.deletePackage(req.params.id, billingTenantId(req));
+    res.json({ success: true });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
 });
 
 // ── Simple Queues (from Mikrotik) ─────────────────────────────
 app.get(["/api/billing/queues", "/monitoring/api/billing/queues"], authMiddleware, async (req, res) => {
   try {
-    const did = billingDeviceId(req);
-    const customers = filterByDevice(loadBillingData("customers"), did);
+    const did = deviceId(req);
+    if (!(await assertDeviceAccess(req, res, did))) return;
+    const customers = await billingDb.getCustomers(billingTenantId(req), did);
     const usedQueues = new Set(customers.map(c => c.simpleQueue));
 
     const queues = await withMikrotik(did, async (api) => {
@@ -988,209 +1480,157 @@ app.get(["/api/billing/queues", "/monitoring/api/billing/queues"], authMiddlewar
 });
 
 // ── Customers CRUD ────────────────────────────────────────────
-app.get(["/api/billing/customers", "/monitoring/api/billing/customers"], authMiddleware, requireRole("admin", "admin_pembayaran"), (req, res) => {
-  const did = billingDeviceId(req);
-  const all = loadBillingData("customers");
-  res.json(filterByDevice(all, did));
-});
-
-app.post(["/api/billing/customers", "/monitoring/api/billing/customers"], authMiddleware, requireRole("admin", "admin_pembayaran"), (req, res) => {
-  const { name, address, phone, packageId, simpleQueue, billingDay, status, installDate, lat, lng, deviceId: did } = req.body;
-  if (!name || !packageId || !simpleQueue) return res.status(400).json({ error: "Name, package, and simple queue are required" });
-  const customers = loadBillingData("customers");
-  const deviceCustomers = customers.filter(c => c.deviceId === (did || DEVICES[0].id));
-  if (deviceCustomers.find(c => c.simpleQueue === simpleQueue)) return res.status(400).json({ error: `Simple queue "${simpleQueue}" already used on this router` });
-  const cust = { id: genId(), deviceId: did || DEVICES[0].id, name, address: address || "", phone: phone || "", packageId, simpleQueue, billingDay: billingDay || 1, status: status || "active", installDate: installDate || new Date().toISOString().slice(0, 10), lat: lat != null ? Number(lat) : null, lng: lng != null ? Number(lng) : null, createdAt: new Date().toISOString() };
-  customers.push(cust);
-  saveBillingData("customers", customers);
-  res.json(cust);
-});
-
-app.put(["/api/billing/customers/:id", "/monitoring/api/billing/customers/:id"], authMiddleware, requireRole("admin", "admin_pembayaran"), (req, res) => {
-  const customers = loadBillingData("customers");
-  const idx = customers.findIndex(c => c.id === req.params.id);
-  if (idx === -1) return res.status(404).json({ error: "Customer not found" });
-  const { name, address, phone, packageId, simpleQueue, billingDay, status, installDate, lat, lng } = req.body;
-  if (simpleQueue && simpleQueue !== customers[idx].simpleQueue) {
-    const deviceCustomers = customers.filter(c => c.deviceId === customers[idx].deviceId && c.id !== req.params.id);
-    if (deviceCustomers.find(c => c.simpleQueue === simpleQueue)) return res.status(400).json({ error: `Simple queue "${simpleQueue}" already used on this router` });
+app.get(["/api/billing/customers", "/monitoring/api/billing/customers"], authMiddleware, requireRole("admin", "staff"), async (req, res) => {
+  try {
+    const did = req.query.deviceId || req.query.device || null;
+    const customers = await billingDb.getCustomers(billingTenantId(req), did);
+    res.json(customers);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
-  customers[idx] = { ...customers[idx], ...(name != null && { name }), ...(address != null && { address }), ...(phone != null && { phone }), ...(packageId != null && { packageId }), ...(simpleQueue != null && { simpleQueue }), ...(billingDay != null && { billingDay }), ...(status != null && { status }), ...(installDate != null && { installDate }), ...(lat != null && { lat: Number(lat) }), ...(lng != null && { lng: Number(lng) }) };
-  saveBillingData("customers", customers);
-  res.json(customers[idx]);
 });
 
-app.delete(["/api/billing/customers/:id", "/monitoring/api/billing/customers/:id"], authMiddleware, requireRole("admin", "admin_pembayaran"), (req, res) => {
-  let customers = loadBillingData("customers");
-  customers = customers.filter(c => c.id !== req.params.id);
-  saveBillingData("customers", customers);
-  res.json({ success: true });
+app.post(["/api/billing/customers", "/monitoring/api/billing/customers"], authMiddleware, requireRole("admin"), async (req, res) => {
+  try {
+    const { name, address, phone, packageId, simpleQueue, billingDay, status, installDate, lat, lng, routerId: rid, deviceId: did } = req.body;
+    const routerId = rid || did;
+    if (!name || !packageId || !simpleQueue || !routerId) return res.status(400).json({ error: "Name, package, router, and simple queue are required" });
+    // For superadmin, use the router's tenantId
+    let tenantId = req.user.tenantId;
+    if (req.user.role === "superadmin") {
+      const prisma = getPrisma();
+      const router = await prisma.router.findUnique({ where: { id: routerId }, select: { tenantId: true } });
+      if (!router) return res.status(400).json({ error: "Router tidak ditemukan" });
+      tenantId = router.tenantId;
+    }
+    const cust = await billingDb.createCustomer(tenantId, { name, address, phone, packageId, simpleQueue, billingDay, status, installDate, lat, lng, routerId });
+    res.json(cust);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.put(["/api/billing/customers/:id", "/monitoring/api/billing/customers/:id"], authMiddleware, requireRole("admin"), async (req, res) => {
+  try {
+    const { name, address, phone, packageId, simpleQueue, billingDay, status, installDate, lat, lng } = req.body;
+    const cust = await billingDb.updateCustomer(req.params.id, billingTenantId(req), { name, address, phone, packageId, simpleQueue, billingDay, status, installDate, lat, lng });
+    res.json(cust);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.delete(["/api/billing/customers/:id", "/monitoring/api/billing/customers/:id"], authMiddleware, requireRole("admin"), async (req, res) => {
+  try {
+    await billingDb.deleteCustomer(req.params.id, billingTenantId(req));
+    res.json({ success: true });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
 });
 
 // ── Invoices CRUD ─────────────────────────────────────────────
-app.get(["/api/billing/invoices", "/monitoring/api/billing/invoices"], authMiddleware, requireRole("admin", "admin_pembayaran"), (req, res) => {
-  const did = billingDeviceId(req);
-  const all = loadBillingData("invoices");
-  res.json(filterByDevice(all, did));
-});
-
-app.post(["/api/billing/invoices", "/monitoring/api/billing/invoices"], authMiddleware, requireRole("admin", "admin_pembayaran"), (req, res) => {
-  const { customerId, month, year, amount, dueDate, notes, deviceId: did } = req.body;
-  if (!customerId || !month || !year) return res.status(400).json({ error: "Customer, month, and year are required" });
-  const invoices = loadBillingData("invoices");
-  const deviceInvoices = invoices.filter(i => i.deviceId === (did || DEVICES[0].id));
-  if (deviceInvoices.find(i => i.customerId === customerId && i.month === month && i.year === year)) return res.status(400).json({ error: "Invoice already exists for this customer/month" });
-  const baseAmount = Number(amount || 0);
-  const ppnAmount = Math.round(baseAmount * 0.11);
-  const now = new Date();
-  const discountAmount = now.getDate() <= 10 ? ppnAmount : 0;
-  const inv = { id: genId(), deviceId: did || DEVICES[0].id, customerId, month: Number(month), year: Number(year), amount: baseAmount, ppn: ppnAmount, discount: discountAmount, totalAmount: baseAmount + ppnAmount - discountAmount, status: "unpaid", dueDate: dueDate || "", paidDate: null, notes: notes || "", createdAt: now.toISOString() };
-  invoices.push(inv);
-  saveBillingData("invoices", invoices);
-  res.json(inv);
-});
-
-app.put(["/api/billing/invoices/:id", "/monitoring/api/billing/invoices/:id"], authMiddleware, requireRole("admin", "admin_pembayaran"), (req, res) => {
-  const invoices = loadBillingData("invoices");
-  const idx = invoices.findIndex(i => i.id === req.params.id);
-  if (idx === -1) return res.status(404).json({ error: "Invoice not found" });
-  const { status, paidDate, amount, dueDate, notes, discount } = req.body;
-  const updated = { ...invoices[idx], ...(status != null && { status }), ...(paidDate != null && { paidDate }), ...(amount != null && { amount: Number(amount) }), ...(dueDate != null && { dueDate }), ...(notes != null && { notes }), ...(discount != null && { discount: Number(discount) }) };
-  // Recalculate PPN and total if amount or discount changed
-  if (amount != null || discount != null) {
-    updated.ppn = Math.round(updated.amount * 0.11);
-    updated.totalAmount = updated.amount + updated.ppn - (updated.discount || 0);
+app.get(["/api/billing/invoices", "/monitoring/api/billing/invoices"], authMiddleware, requireRole("admin", "staff"), async (req, res) => {
+  try {
+    const did = req.query.deviceId || req.query.device || null;
+    const filters = { status: req.query.status, customerId: req.query.customerId, month: req.query.month, year: req.query.year };
+    const invoices = await billingDb.getInvoices(billingTenantId(req), did, filters);
+    res.json(invoices);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
-  invoices[idx] = updated;
-  saveBillingData("invoices", invoices);
-  res.json(invoices[idx]);
 });
 
-app.delete(["/api/billing/invoices/:id", "/monitoring/api/billing/invoices/:id"], authMiddleware, requireRole("admin", "admin_pembayaran"), (req, res) => {
-  let invoices = loadBillingData("invoices");
-  invoices = invoices.filter(i => i.id !== req.params.id);
-  saveBillingData("invoices", invoices);
-  res.json({ success: true });
+app.post(["/api/billing/invoices", "/monitoring/api/billing/invoices"], authMiddleware, requireRole("admin"), async (req, res) => {
+  try {
+    const { customerId, month, year, amount, dueDate, notes } = req.body;
+    if (!customerId || !month || !year) return res.status(400).json({ error: "Customer, month, and year are required" });
+    // For superadmin, use the customer's tenantId
+    let tenantId = req.user.tenantId;
+    if (req.user.role === "superadmin") {
+      const prisma = getPrisma();
+      const customer = await prisma.customer.findUnique({ where: { id: customerId }, select: { tenantId: true } });
+      if (!customer) return res.status(400).json({ error: "Customer tidak ditemukan" });
+      tenantId = customer.tenantId;
+    }
+    const inv = await billingDb.createInvoice(tenantId, { customerId, month, year, amount, dueDate, notes });
+    res.json(inv);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.put(["/api/billing/invoices/:id", "/monitoring/api/billing/invoices/:id"], authMiddleware, requireRole("admin"), async (req, res) => {
+  try {
+    const { status, paidDate, amount, dueDate, notes, discount } = req.body;
+    const inv = await billingDb.updateInvoice(req.params.id, billingTenantId(req), { status, paidDate, amount, dueDate, notes, discount });
+    res.json(inv);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.delete(["/api/billing/invoices/:id", "/monitoring/api/billing/invoices/:id"], authMiddleware, requireRole("admin"), async (req, res) => {
+  try {
+    await billingDb.deleteInvoice(req.params.id, billingTenantId(req));
+    res.json({ success: true });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
 });
 
 // ── Billing Summary ───────────────────────────────────────────
-app.get(["/api/billing/summary", "/monitoring/api/billing/summary"], authMiddleware, requireRole("admin", "admin_pembayaran"), (req, res) => {
-  const did = billingDeviceId(req);
-  const customers = filterByDevice(loadBillingData("customers"), did);
-  const invoices = filterByDevice(loadBillingData("invoices"), did);
-  const packages = filterByDevice(loadBillingData("packages"), did);
-
-  const activeCustomers = customers.filter(c => c.status === "active").length;
-  const totalCustomers = customers.length;
-  const unpaidInvoices = invoices.filter(i => i.status === "unpaid");
-  const paidInvoices = invoices.filter(i => i.status === "paid");
-
-  const now = new Date();
-  const today = now.getDate();
-  const currentMonth = now.getMonth() + 1;
-  const currentYear = now.getFullYear();
-
-  // Effective total: base + ppn - discount (discount applies for current/future month if 1-10)
-  const effectiveTotal = (inv) => {
-    const base = inv.amount;
-    const ppn = inv.ppn || Math.round(base * 0.11);
-    if (inv.status === "paid") return base + ppn - (inv.discount || 0);
-    // unpaid: check if current/future month
-    const isPast = inv.year < currentYear || (inv.year === currentYear && inv.month < currentMonth);
-    const discount = isPast ? 0 : (today <= 10 ? ppn : 0);
-    return base + ppn - discount;
-  };
-
-  const totalUnpaid = unpaidInvoices.reduce((s, i) => s + effectiveTotal(i), 0);
-  const totalPaid = paidInvoices.reduce((s, i) => s + effectiveTotal(i), 0);
-
-  const thisMonthInvoices = invoices.filter(i => i.month === currentMonth && i.year === currentYear);
-  const thisMonthPaid = thisMonthInvoices.filter(i => i.status === "paid").reduce((s, i) => s + effectiveTotal(i), 0);
-  const thisMonthUnpaid = thisMonthInvoices.filter(i => i.status === "unpaid").reduce((s, i) => s + effectiveTotal(i), 0);
-
-  res.json({
-    totalCustomers,
-    activeCustomers,
-    totalPackages: packages.length,
-    totalInvoices: invoices.length,
-    totalPaid,
-    totalUnpaid,
-    totalRevenue: totalPaid + totalUnpaid,
-    thisMonthPaid,
-    thisMonthUnpaid,
-    thisMonthTotal: thisMonthPaid + thisMonthUnpaid,
-    unpaidCount: unpaidInvoices.length,
-    paidCount: paidInvoices.length,
-  });
+app.get(["/api/billing/summary", "/monitoring/api/billing/summary"], authMiddleware, requireRole("admin", "staff"), async (req, res) => {
+  try {
+    const did = req.query.deviceId || req.query.device || null;
+    const summary = await billingDb.getBillingSummary(billingTenantId(req), did);
+    res.json(summary);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ── Auto-generate invoices ─────────────────────────────────────
-app.post(["/api/billing/generate-invoices", "/monitoring/api/billing/generate-invoices"], authMiddleware, requireRole("admin", "admin_pembayaran"), (req, res) => {
-  const { month, year, deviceId: did } = req.body;
-  if (!month || !year) return res.status(400).json({ error: "Month and year are required" });
-  const deviceDid = did || DEVICES[0].id;
-  const customers = filterByDevice(loadBillingData("customers"), deviceDid).filter(c => c.status === "active");
-  const packages = loadBillingData("packages");
-  const invoices = loadBillingData("invoices");
-  let created = 0;
-  for (const cust of customers) {
-    if (invoices.find(i => i.customerId === cust.id && i.month === Number(month) && i.year === Number(year))) continue;
-    const pkg = packages.find(p => p.id === cust.packageId);
-    const basePrice = pkg ? pkg.price : 0;
-    const ppnPrice = Math.round(basePrice * 0.11);
-    const now = new Date();
-    const discountPrice = now.getDate() <= 10 ? ppnPrice : 0;
-    invoices.push({ id: genId(), deviceId: deviceDid, customerId: cust.id, month: Number(month), year: Number(year), amount: basePrice, ppn: ppnPrice, discount: discountPrice, totalAmount: basePrice + ppnPrice - discountPrice, status: "unpaid", dueDate: "", paidDate: null, notes: "", createdAt: now.toISOString() });
-    created++;
+app.post(["/api/billing/generate-invoices", "/monitoring/api/billing/generate-invoices"], authMiddleware, requireRole("admin"), async (req, res) => {
+  try {
+    const { month, year, deviceId: did } = req.body;
+    if (!month || !year) return res.status(400).json({ error: "Month and year are required" });
+    const result = await billingDb.generateInvoices(billingTenantId(req), month, year, did);
+    res.json(result);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
   }
-  saveBillingData("invoices", invoices);
-  res.json({ created, total: customers.length });
 });
 
 // ── Billing: list devices with counts ─────────────────────────
-app.get(["/api/billing/devices", "/monitoring/api/billing/devices"], authMiddleware, requireRole("admin", "admin_pembayaran"), (req, res) => {
-  const customers = loadBillingData("customers");
-  const invoices = loadBillingData("invoices");
-  const result = DEVICES.map(d => {
-    const dc = customers.filter(c => c.deviceId === d.id);
-    const di = invoices.filter(i => i.deviceId === d.id);
-    return {
-      id: d.id,
-      name: d.name,
-      customerCount: dc.length,
-      activeCount: dc.filter(c => c.status === "active").length,
-      invoiceCount: di.length,
-      unpaidCount: di.filter(i => i.status === "unpaid").length,
-    };
-  });
-  res.json(result);
+app.get(["/api/billing/devices", "/monitoring/api/billing/devices"], authMiddleware, requireRole("admin", "staff"), async (req, res) => {
+  try {
+    const devices = await billingDb.getBillingDevices(billingTenantId(req));
+    res.json(devices);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ── Backup & Restore ──────────────────────────────────────────
-app.get(["/api/backup", "/monitoring/api/backup"], authMiddleware, requireRole("admin", "admin_pembayaran"), (req, res) => {
+app.get(["/api/backup", "/monitoring/api/backup"], authMiddleware, requireRole("admin"), async (req, res) => {
   try {
-    const did = billingDeviceId(req);
-    const allPkgs = loadBillingData("packages");
-    const allCust = loadBillingData("customers");
-    const allInv = loadBillingData("invoices");
+    const did = req.query.deviceId || req.query.device || null;
+    const data = await billingDb.getBackupData(billingTenantId(req), did);
 
-    const packages = filterByDevice(allPkgs, did);
-    const customers = filterByDevice(allCust, did);
-    const invoices = filterByDevice(allInv, did);
-
-    const device = DEVICES.find(d => d.id === did);
+    const device = did ? DEVICES.find(d => d.id === did) : DEVICES[0];
 
     const backup = {
-      version: "1.0",
+      version: "2.0",
       timestamp: new Date().toISOString(),
       deviceId: did,
       deviceName: device?.name || did,
-      data: { packages, customers, invoices },
-      meta: { packages: packages.length, customers: customers.length, invoices: invoices.length },
+      data,
+      meta: { packages: data.packages.length, customers: data.customers.length, invoices: data.invoices.length },
     };
 
     res.setHeader("Content-Type", "application/json");
-    const safeName = (device?.name || did).replace(/[^a-zA-Z0-9]/g, "-").slice(0, 30);
+    const safeName = (device?.name || did || "all").replace(/[^a-zA-Z0-9]/g, "-").slice(0, 30);
     res.setHeader("Content-Disposition", `attachment; filename="mikromon-${safeName}-${new Date().toISOString().slice(0,10)}.json"`);
     res.json(backup);
   } catch (err) {
@@ -1198,168 +1638,146 @@ app.get(["/api/backup", "/monitoring/api/backup"], authMiddleware, requireRole("
   }
 });
 
-app.post(["/api/backup/restore", "/monitoring/api/backup/restore"], authMiddleware, requireRole("admin", "admin_pembayaran"), (req, res) => {
+app.post(["/api/backup/restore", "/monitoring/api/backup/restore"], backupLimiter, authMiddleware, requireRole("admin"), async (req, res) => {
   try {
-    const { data, mode, targetDevice } = req.body;
+    const { data, mode } = req.body;
 
-    if (!data || !data.packages || !data.customers || !data.invoices) {
+    if (!data || !Array.isArray(data.packages) || !Array.isArray(data.customers) || !Array.isArray(data.invoices)) {
       return res.status(400).json({ error: "Invalid backup file format" });
     }
-
-    // Override deviceId if targetDevice is specified
-    const did = targetDevice || data.deviceId || DEVICES[0].id;
-
-    // Assign deviceId to all restored data
-    const pkgWithDevice = data.packages.map(p => ({ ...p, deviceId: did }));
-    const custWithDevice = data.customers.map(c => ({ ...c, deviceId: did }));
-    const invWithDevice = data.invoices.map(i => ({ ...i, deviceId: did }));
-
-    if (mode === "replace") {
-      // Remove existing data for this device, then add restored data
-      const existingPkgs = loadBillingData("packages").filter(p => p.deviceId !== did);
-      const existingCust = loadBillingData("customers").filter(c => c.deviceId !== did);
-      const existingInv = loadBillingData("invoices").filter(i => i.deviceId !== did);
-
-      saveBillingData("packages", [...existingPkgs, ...pkgWithDevice]);
-      saveBillingData("customers", [...existingCust, ...custWithDevice]);
-      saveBillingData("invoices", [...existingInv, ...invWithDevice]);
-    } else {
-      // Merge: add missing items, skip existing IDs
-      const existingPkgs = loadBillingData("packages");
-      const existingCust = loadBillingData("customers");
-      const existingInv = loadBillingData("invoices");
-
-      const existingPkgIds = new Set(existingPkgs.map(p => p.id));
-      const existingCustIds = new Set(existingCust.map(c => c.id));
-      const existingInvIds = new Set(existingInv.map(i => i.id));
-
-      const newPkgs = pkgWithDevice.filter(p => !existingPkgIds.has(p.id));
-      const newCust = custWithDevice.filter(c => !existingCustIds.has(c.id));
-      const newInv = invWithDevice.filter(i => !existingInvIds.has(i.id));
-
-      saveBillingData("packages", [...existingPkgs, ...newPkgs]);
-      saveBillingData("customers", [...existingCust, ...newCust]);
-      saveBillingData("invoices", [...existingInv, ...newInv]);
+    if (data.packages.length > 1000 || data.customers.length > 10000 || data.invoices.length > 100000) {
+      return res.status(400).json({ error: "Backup data too large" });
     }
+
+    const restored = await billingDb.restoreBackup(req.user.tenantId, data, mode);
 
     res.json({
       success: true,
-      message: mode === "replace" ? `Data router ${did} berhasil di-restore` : `Data router ${did} berhasil di-merge`,
-      deviceId: did,
-      restored: { packages: pkgWithDevice.length, customers: custWithDevice.length, invoices: invWithDevice.length },
+      message: mode === "replace" ? "Data berhasil di-restore" : "Data berhasil di-merge",
+      restored,
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-app.get(["/api/backup/info", "/monitoring/api/backup/info"], authMiddleware, requireRole("admin", "admin_pembayaran"), (req, res) => {
-  const did = billingDeviceId(req);
-  const allPkgs = loadBillingData("packages");
-  const allCust = loadBillingData("customers");
-  const allInv = loadBillingData("invoices");
-
-  const packages = filterByDevice(allPkgs, did);
-  const customers = filterByDevice(allCust, did);
-  const invoices = filterByDevice(allInv, did);
-
-  const paidInvoices = invoices.filter(i => i.status === "paid");
-  const unpaidInvoices = invoices.filter(i => i.status === "unpaid");
-
-  res.json({
-    deviceId: did,
-    packages: packages.length,
-    customers: customers.length,
-    customersActive: customers.filter(c => c.status === "active").length,
-    invoices: invoices.length,
-    invoicesPaid: paidInvoices.length,
-    invoicesUnpaid: unpaidInvoices.length,
-    totalRevenue: invoices.reduce((s, i) => s + (i.totalAmount || i.amount), 0),
-    diskUsage: {
-      packages: fs.statSync(billingFile("packages")).size,
-      customers: fs.statSync(billingFile("customers")).size,
-      invoices: fs.statSync(billingFile("invoices")).size,
-    },
-  });
+app.get(["/api/backup/info", "/monitoring/api/backup/info"], authMiddleware, requireRole("admin", "staff"), async (req, res) => {
+  try {
+    const did = req.query.deviceId || req.query.device || null;
+    const info = await billingDb.getBackupInfo(billingTenantId(req), did);
+    res.json({ deviceId: did, ...info });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-app.get(["/api/backup/info-all", "/monitoring/api/backup/info-all"], authMiddleware, requireRole("admin", "admin_pembayaran"), (req, res) => {
-  const allPkgs = loadBillingData("packages");
-  const allCust = loadBillingData("customers");
-  const allInv = loadBillingData("invoices");
+app.get(["/api/backup/info-all", "/monitoring/api/backup/info-all"], authMiddleware, requireRole("admin", "staff"), async (req, res) => {
+  try {
+    const prisma = getPrisma();
+    const routers = await prisma.router.findMany({ where: { tenantId: req.user.tenantId, isActive: true } });
 
-  const devices = DEVICES.map(d => {
-    const pkgs = filterByDevice(allPkgs, d.id);
-    const cust = filterByDevice(allCust, d.id);
-    const inv = filterByDevice(allInv, d.id);
-    return {
-      id: d.id,
-      name: d.name,
-      packages: pkgs.length,
-      customers: cust.length,
-      customersActive: cust.filter(c => c.status === "active").length,
-      invoices: inv.length,
-      invoicesPaid: inv.filter(i => i.status === "paid").length,
-      invoicesUnpaid: inv.filter(i => i.status === "unpaid").length,
-      totalRevenue: inv.reduce((s, i) => s + (i.totalAmount || i.amount), 0),
-    };
-  });
+    const devices = [];
+    for (const r of routers) {
+      const info = await billingDb.getBackupInfo(billingTenantId(req), r.id);
+      devices.push({ id: r.id, name: r.name, ...info });
+    }
 
-  res.json({
-    all: {
-      packages: allPkgs.length,
-      customers: allCust.length,
-      invoices: allInv.length,
-      totalRevenue: allInv.reduce((s, i) => s + (i.totalAmount || i.amount), 0),
-    },
-    devices,
-    diskUsage: {
-      packages: fs.statSync(billingFile("packages")).size,
-      customers: fs.statSync(billingFile("customers")).size,
-      invoices: fs.statSync(billingFile("invoices")).size,
-      total: fs.statSync(billingFile("packages")).size + fs.statSync(billingFile("customers")).size + fs.statSync(billingFile("invoices")).size,
-    },
-  });
+    const allInfo = await billingDb.getBackupInfo(billingTenantId(req));
+
+    res.json({ all: allInfo, devices });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ═══════════════════════════════════════════════════════════════
 // WHATSAPP GATEWAY
 // ═══════════════════════════════════════════════════════════════
+// Router Connection Failure Notifications (UI only)
+// ═══════════════════════════════════════════════════════════════
+const NOTIF_FILE = path.join(__dirname, "data", "router-notifications.json");
 
-// Initialize WhatsApp on startup
-waGateway.connectWhatsApp().catch(err => console.error("[WA] Init error:", err.message));
+function loadNotifFile() {
+  try {
+    if (fs.existsSync(NOTIF_FILE)) return JSON.parse(fs.readFileSync(NOTIF_FILE, "utf-8"));
+  } catch {}
+  return { pending: [], history: [] };
+}
 
-// ── WA Status ─────────────────────────────────────────────────
+function saveNotifFile(data) {
+  try {
+    fs.writeFileSync(NOTIF_FILE + ".tmp", JSON.stringify(data, null, 2));
+    fs.renameSync(NOTIF_FILE + ".tmp", NOTIF_FILE);
+  } catch {}
+}
+// Initialize WhatsApp on startup (auto-connect tenants with existing auth)
+waGateway.connectAll().catch(err => console.error("[WA] Init error:", err.message));
+
+// ── WA Status (per-tenant) ─────────────────────────────────────
 app.get(["/api/wa/status", "/monitoring/api/wa/status"], authMiddleware, requireRole("admin", "admin_pembayaran"), (req, res) => {
-  res.json(waGateway.getStatus());
+  const tenantId = req.user.tenantId;
+  res.json(waGateway.getStatus(tenantId));
 });
 
-// ── WA Connect (start QR flow) ─────────────────────────────────
-app.post(["/api/wa/connect", "/monitoring/api/wa/connect"], authMiddleware, async (req, res) => {
+// ── WA Status All Tenants (superadmin) ─────────────────────────
+app.get(["/api/wa/status-all", "/monitoring/api/wa/status-all"], authMiddleware, requireRole("superadmin"), (req, res) => {
+  res.json(waGateway.getAllStatus());
+});
+
+// ── WA Status for specific tenant (superadmin) ─────────────────
+app.get(["/api/wa/status/:tenantId", "/monitoring/api/wa/status/:tenantId"], authMiddleware, requireRole("superadmin"), (req, res) => {
+  res.json(waGateway.getStatus(req.params.tenantId));
+});
+
+// ── WA Connect for specific tenant (superadmin) ────────────────
+app.post(["/api/wa/connect/:tenantId", "/monitoring/api/wa/connect/:tenantId"], waLimiter, authMiddleware, requireRole("superadmin"), async (req, res) => {
   try {
-    await waGateway.connectWhatsApp();
+    await waGateway.connect(req.params.tenantId);
     res.json({ success: true, message: "Connecting... check QR" });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// ── WA Disconnect ──────────────────────────────────────────────
-app.post(["/api/wa/disconnect", "/monitoring/api/wa/disconnect"], authMiddleware, async (req, res) => {
+// ── WA Disconnect for specific tenant (superadmin) ─────────────
+app.post(["/api/wa/disconnect/:tenantId", "/monitoring/api/wa/disconnect/:tenantId"], waLimiter, authMiddleware, requireRole("superadmin"), async (req, res) => {
   try {
-    await waGateway.disconnectWhatsApp();
+    await waGateway.disconnect(req.params.tenantId);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// ── WA Send Single Message ─────────────────────────────────────
-app.post(["/api/wa/send", "/monitoring/api/wa/send"], authMiddleware, async (req, res) => {
+// ── WA Connect (per-tenant, start QR flow) ─────────────────────
+app.post(["/api/wa/connect", "/monitoring/api/wa/connect"], waLimiter, authMiddleware, requireRole("admin"), async (req, res) => {
+  try {
+    const tenantId = req.user.tenantId;
+    await waGateway.connect(tenantId);
+    res.json({ success: true, message: "Connecting... check QR" });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── WA Disconnect (per-tenant) ──────────────────────────────────
+app.post(["/api/wa/disconnect", "/monitoring/api/wa/disconnect"], waLimiter, authMiddleware, requireRole("admin"), async (req, res) => {
+  try {
+    const tenantId = req.user.tenantId;
+    await waGateway.disconnect(tenantId);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── WA Send Single Message (per-tenant) ────────────────────────
+app.post(["/api/wa/send", "/monitoring/api/wa/send"], waLimiter, authMiddleware, requireRole("admin"), async (req, res) => {
   const { phone, text } = req.body;
   if (!phone || !text) return res.status(400).json({ error: "Phone and text are required" });
   try {
-    const result = await waGateway.sendMessage(phone, text);
+    const tenantId = req.user.tenantId;
+    const result = await waGateway.sendMessage(tenantId, phone, text);
     res.json(result);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1367,30 +1785,28 @@ app.post(["/api/wa/send", "/monitoring/api/wa/send"], authMiddleware, async (req
 });
 
 // ── WA Send Invoice to Customer ────────────────────────────────
-app.post(["/api/wa/send-invoice", "/monitoring/api/wa/send-invoice"], authMiddleware, async (req, res) => {
-  const { invoiceId, deviceId } = req.body;
+app.post(["/api/wa/send-invoice", "/monitoring/api/wa/send-invoice"], waLimiter, authMiddleware, requireRole("admin"), async (req, res) => {
+  const { invoiceId } = req.body;
   if (!invoiceId) return res.status(400).json({ error: "Invoice ID is required" });
 
   try {
-    const invoices = loadBillingData("invoices");
-    const invoice = invoices.find(i => i.id === invoiceId);
+    const prisma = getPrisma();
+    const invoice = await prisma.invoice.findFirst({
+      where: { id: invoiceId, tenantId: req.user.tenantId },
+      include: { customer: { include: { package: true } } },
+    });
     if (!invoice) return res.status(404).json({ error: "Invoice not found" });
 
-    const customers = filterByDevice(loadBillingData("customers"), invoice.deviceId);
-    const customer = customers.find(c => c.id === invoice.customerId);
-    if (!customer) return res.status(404).json({ error: "Customer not found" });
+    const customer = invoice.customer;
     if (!customer.phone) return res.status(400).json({ error: "Customer has no phone number" });
-
-    const packages = loadBillingData("packages");
-    const pkg = packages.find(p => p.id === customer.packageId);
 
     const text = generateInvoiceText({
       invoice,
       customer,
-      packageName: pkg ? pkg.name : "-",
+      packageName: customer.package ? customer.package.name : "-",
     });
 
-    const result = await waGateway.sendMessage(customer.phone, text);
+    const result = await waGateway.sendMessage(req.user.tenantId, customer.phone, text);
     res.json({ ...result, customer: customer.name, phone: customer.phone });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1398,34 +1814,37 @@ app.post(["/api/wa/send-invoice", "/monitoring/api/wa/send-invoice"], authMiddle
 });
 
 // ── WA Broadcast to All Unpaid ─────────────────────────────────
-app.post(["/api/wa/broadcast", "/monitoring/api/wa/broadcast"], authMiddleware, async (req, res) => {
+app.post(["/api/wa/broadcast", "/monitoring/api/wa/broadcast"], waLimiter, authMiddleware, requireRole("admin"), async (req, res) => {
   const { deviceId, delay } = req.body;
-  const did = deviceId || DEVICES[0].id;
+  const did = deviceId || null;
   const delayMs = (delay || 15) * 1000; // default 15 seconds
 
   try {
-    const customers = filterByDevice(loadBillingData("customers"), did);
-    const invoices = filterByDevice(loadBillingData("invoices"), did);
-    const packages = loadBillingData("packages");
+    const prisma = getPrisma();
+    const where = { tenantId: req.user.tenantId, status: "unpaid" };
+    if (did) where.routerId = did;
 
-    // Group ALL unpaid invoices by customer
+    const invoices = await prisma.invoice.findMany({
+      where,
+      include: { customer: { include: { package: true } } },
+    });
+
+    // Group by customer
     const unpaidByCustomer = {};
-    for (const inv of invoices.filter(i => i.status === "unpaid")) {
+    for (const inv of invoices) {
       if (!unpaidByCustomer[inv.customerId]) unpaidByCustomer[inv.customerId] = [];
       unpaidByCustomer[inv.customerId].push(inv);
     }
 
-    // Build messages per customer
     const messages = [];
     for (const [customerId, customerInvoices] of Object.entries(unpaidByCustomer)) {
-      const customer = customers.find(c => c.id === customerId);
-      if (!customer || !customer.phone) continue;
+      const customer = customerInvoices[0].customer;
+      if (!customer.phone) continue;
 
-      const pkg = packages.find(p => p.id === customer.packageId);
       const text = generateAllUnpaidText({
         invoices: customerInvoices,
         customer,
-        packageName: pkg ? pkg.name : "-",
+        packageName: customer.package ? customer.package.name : "-",
       });
 
       messages.push({ phone: customer.phone, text, customerName: customer.name });
@@ -1435,8 +1854,7 @@ app.post(["/api/wa/broadcast", "/monitoring/api/wa/broadcast"], authMiddleware, 
       return res.json({ success: true, message: "Tidak ada tagihan belum bayar", total: 0 });
     }
 
-    // Start broadcast in background
-    waGateway.broadcastMessages(messages, delayMs).catch(err => {
+    waGateway.broadcastMessages(req.user.tenantId, messages, delayMs).catch(err => {
       console.error("[WA] Broadcast error:", err.message);
     });
 
@@ -1452,18 +1870,18 @@ app.post(["/api/wa/broadcast", "/monitoring/api/wa/broadcast"], authMiddleware, 
 
 // ── WA Broadcast Status ────────────────────────────────────────
 app.get(["/api/wa/broadcast-status", "/monitoring/api/wa/broadcast-status"], authMiddleware, requireRole("admin", "admin_pembayaran"), (req, res) => {
-  res.json(waGateway.getStatus().broadcast);
+  res.json(waGateway.getStatus(req.user.tenantId).broadcast);
 });
 
 // ── WA Stop Broadcast ──────────────────────────────────────────
 app.post(["/api/wa/broadcast-stop", "/monitoring/api/wa/broadcast-stop"], authMiddleware, requireRole("admin", "admin_pembayaran"), (req, res) => {
-  waGateway.stopBroadcast();
+  waGateway.stopBroadcast(req.user.tenantId);
   res.json({ success: true });
 });
 
 // ─── Static Files & Routing ─────────────────────────────────────
 const staticPath = path.resolve(__dirname, "out");
-const pageFiles = ["traffic", "devices", "alerts", "settings", "settings/users", "login", "clients", "mrtg", "billing", "billing/packages", "billing/customers", "billing/invoices", "billing/history", "billing/map", "billing/monthly", "billing/whatsapp", "billing/backup"];
+const pageFiles = ["traffic", "devices", "routers", "tenants", "alerts", "settings", "settings/users", "login", "clients", "mrtg", "billing", "billing/packages", "billing/customers", "billing/invoices", "billing/history", "billing/map", "billing/monthly", "billing/whatsapp", "billing/backup"];
 
 // Serve static assets (_next/*, etc.)
 app.use("/monitoring", express.static(staticPath, {
@@ -1500,10 +1918,34 @@ app.get("/", (req, res) => {
   res.redirect(301, "/monitoring");
 });
 
+// ─── Async Wrapper (prevents uncaught exceptions in routes) ────
+function asyncHandler(fn) {
+  return (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+}
+
 // ─── Error Handler ──────────────────────────────────────────────
 app.use((err, req, res, next) => {
-  console.error("[Server] Error:", err.message);
-  res.status(err.status || 500).json({ error: err.message });
+  const msg = err?.message || String(err);
+  // Transient MikroTik errors → 503, not 500
+  if (msg.includes("Timed out") || msg.includes("SOCKTMOUT") || msg.includes("Connection reset") || msg.includes("ECONNRESET")) {
+    console.error("[Server] MikroTik error:", msg);
+    return res.status(503).json({ error: "Router unavailable. Try again." });
+  }
+  console.error("[Server] Error:", msg);
+  res.status(err.status || 500).json({ error: msg });
+});
+
+// ─── API: Router Notifications ─────────────────────────────────
+app.get(["/api/notifications", "/monitoring/api/notifications"], authMiddleware, (req, res) => {
+  const notifs = loadNotifFile();
+  res.json(notifs);
+});
+
+app.post(["/api/notifications/clear", "/monitoring/api/notifications/clear"], authMiddleware, requireRole("superadmin"), (req, res) => {
+  const notifs = loadNotifFile();
+  notifs.pending = [];
+  saveNotifFile(notifs);
+  res.json({ success: true });
 });
 
 // ─── Start Server ───────────────────────────────────────────────
@@ -1517,11 +1959,44 @@ const server = app.listen(PORT, "0.0.0.0", () => {
 // ─── Graceful Shutdown ──────────────────────────────────────────
 function shutdown(signal) {
   console.log(`\n[Server] ${signal} received, shutting down...`);
+  // Close all persistent API connections
+  for (const [id, conn] of apiConnections) {
+    try { conn.api.close(); } catch {}
+  }
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(1), 5000);
 }
 
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
-process.on("uncaughtException", (err) => console.error("[Server] Uncaught:", err.message));
-process.on("unhandledRejection", (err) => console.error("[Server] Unhandled:", err.message || err));
+// ─── Transient errors that should NOT crash the process ────────
+const TRANSIENT_ERRORS = [
+  "SOCKTMOUT", "ECONNRESET", "ECONNREFUSED", "ETIMEDOUT",
+  "EPIPE", "ENETUNREACH", "EHOSTUNREACH",
+  "RosException", "Timed out", "Connection reset",
+  "Connection closed", "socket hang up",
+];
+
+function isTransientError(err) {
+  const msg = err?.message || String(err);
+  const code = err?.code || err?.errno || "";
+  return TRANSIENT_ERRORS.some(e => msg.includes(e) || code === e);
+}
+
+process.on("uncaughtException", (err) => {
+  if (isTransientError(err)) {
+    console.error("[Server] Transient error (continuing):", err.message);
+    return; // Don't exit — just log and keep running
+  }
+  console.error("[Server] Fatal uncaught:", err);
+  process.exit(1);
+});
+process.on("unhandledRejection", (err) => {
+  const error = err instanceof Error ? err : new Error(String(err));
+  if (isTransientError(error)) {
+    console.error("[Server] Transient rejection (continuing):", error.message);
+    return;
+  }
+  console.error("[Server] Fatal rejection:", error);
+  process.exit(1);
+});

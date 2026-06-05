@@ -98,13 +98,17 @@ export default function WhatsAppPage() {
   };
 
   const handleDisconnect = async () => {
-    if (!confirm("Putuskan koneksi WhatsApp?")) return;
+    if (!confirm("Putuskan koneksi WhatsApp?")) return; // TODO: replace with custom modal
     await waFetch("/api/wa/disconnect", { method: "POST" });
     setMsg("WhatsApp diputus");
   };
 
   const handleBroadcast = async () => {
-    if (!confirm(`Kirim rekap tagihan belum bayar ke ${customersWithUnpaid.length} pelanggan?`)) return;
+    if (broadcastDelay < 10) {
+      setMsg("Delay minimal 10 detik untuk hindari ban WhatsApp");
+      return;
+    }
+    if (!confirm(`Kirim rekap tagihan belum bayar ke ${customersWithUnpaid.length} pelanggan?`)) return; // TODO: replace with custom modal
     setSending(true);
     setMsg("");
     try {
@@ -125,7 +129,7 @@ export default function WhatsAppPage() {
   };
 
   return (
-    <div className="p-5 sm:p-8 space-y-6 max-w-[1000px] mx-auto">
+    <div className="p-5 sm:p-8 space-y-6 w-full">
       {/* Header */}
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
         <div className="flex items-center gap-3">
@@ -178,8 +182,8 @@ export default function WhatsAppPage() {
           </div>
         </div>
 
-        {/* QR Code */}
-        {waStatus?.status === "connecting" && waStatus.qr && (
+        {/* QR Code — only render data: URLs to prevent SSRF/script injection */}
+        {waStatus?.status === "connecting" && waStatus.qr && waStatus.qr.startsWith("data:") && (
           <div className="mt-5 pt-5 border-t border-[var(--border-light)] flex flex-col items-center gap-3">
             <div className="p-3 bg-white rounded-2xl shadow-[var(--shadow-md)]">
               <img src={waStatus.qr} alt="QR Code" className="w-[220px] h-[220px]" />

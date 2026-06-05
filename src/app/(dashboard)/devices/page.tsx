@@ -17,6 +17,7 @@ import {
   Search,
   X,
   Activity,
+  Loader2,
 } from "lucide-react";
 
 export default function DevicesPage() {
@@ -159,50 +160,98 @@ function InfoRow({ label, value, mono }: { label: string; value: string; mono?: 
 }
 
 function AddDeviceModal({ onClose }: { onClose: () => void }) {
+  const [name, setName] = useState("");
+  const [host, setHost] = useState("");
+  const [port, setPort] = useState("8728");
+  const [username, setUsername] = useState("admin");
+  const [password, setPassword] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!name.trim() || !host.trim()) {
+      setError("Nama dan IP address wajib diisi");
+      return;
+    }
+    setSaving(true);
+    setError("");
+    try {
+      const res = await fetch("/monitoring/api/routers", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: name.trim(),
+          host: host.trim(),
+          port: Number(port) || 8728,
+          user: username.trim() || "admin",
+          password,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Gagal menambahkan device");
+      onClose();
+      window.location.reload();
+    } catch (e: any) {
+      setError(e.message);
+    }
+    setSaving(false);
+  };
+
+  // Handle Escape key
+  useEffect(() => {
+    const handleEscape = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    document.addEventListener("keydown", handleEscape);
+    return () => document.removeEventListener("keydown", handleEscape);
+  }, [onClose]);
+
   return (
     <div className="fixed inset-0 z-[100] flex items-center justify-center p-4">
       <div className="absolute inset-0 bg-black/40 backdrop-blur-sm" onClick={onClose} />
       <div className="relative card w-full max-w-md p-6 animate-scale-in !rounded-2xl">
         <div className="flex items-center justify-between mb-5">
           <h2 className="text-[18px] font-semibold text-[var(--text-primary)]">Add Device</h2>
-          <button onClick={onClose} className="w-8 h-8 rounded-lg flex items-center justify-center hover:bg-[var(--bg-base)] transition-colors">
+          <button onClick={onClose} aria-label="Tutup" className="w-8 h-8 rounded-lg flex items-center justify-center hover:bg-[var(--bg-base)] transition-colors">
             <X className="w-5 h-5 text-[var(--text-tertiary)]" />
           </button>
         </div>
 
-        <form className="space-y-4">
+        {error && (
+          <div className="p-3 rounded-xl bg-[var(--red-soft)] text-[13px] text-[var(--red)] font-medium mb-4">{error}</div>
+        )}
+
+        <form onSubmit={handleSubmit} className="space-y-4">
           <div>
             <label className="block text-[13px] font-medium text-[var(--text-secondary)] mb-1.5">Device Name</label>
-            <input type="text" placeholder="e.g. Main Office Router" />
+            <input type="text" placeholder="e.g. Main Office Router" value={name} onChange={e => setName(e.target.value)} />
           </div>
 
           <div className="grid grid-cols-3 gap-3">
             <div className="col-span-2">
               <label className="block text-[13px] font-medium text-[var(--text-secondary)] mb-1.5">IP Address</label>
-              <input type="text" placeholder="192.168.1.1" className="font-mono" />
+              <input type="text" placeholder="192.168.1.1" className="font-mono" value={host} onChange={e => setHost(e.target.value)} />
             </div>
             <div>
               <label className="block text-[13px] font-medium text-[var(--text-secondary)] mb-1.5">Port</label>
-              <input type="number" placeholder="8728" defaultValue={8728} className="font-mono" />
+              <input type="number" placeholder="8728" className="font-mono" value={port} onChange={e => setPort(e.target.value)} min={1} max={65535} />
             </div>
           </div>
 
           <div className="grid grid-cols-2 gap-3">
             <div>
               <label className="block text-[13px] font-medium text-[var(--text-secondary)] mb-1.5">Username</label>
-              <input type="text" placeholder="admin" />
+              <input type="text" placeholder="admin" value={username} onChange={e => setUsername(e.target.value)} />
             </div>
             <div>
               <label className="block text-[13px] font-medium text-[var(--text-secondary)] mb-1.5">Password</label>
-              <input type="password" placeholder="••••••" />
+              <input type="password" placeholder="••••••" value={password} onChange={e => setPassword(e.target.value)} />
             </div>
           </div>
 
           <div className="flex gap-3 pt-2">
             <button type="button" onClick={onClose} className="btn btn-secondary flex-1">Cancel</button>
-            <button type="button" className="btn btn-primary flex-1">
-              <Wifi className="w-4 h-4" />
-              Test & Save
+            <button type="submit" disabled={saving} className="btn btn-primary flex-1">
+              {saving ? <><Loader2 className="w-4 h-4 animate-spin" /> Menyimpan...</> : <><Wifi className="w-4 h-4" /> Test & Save</>}
             </button>
           </div>
         </form>

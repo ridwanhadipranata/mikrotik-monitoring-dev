@@ -57,6 +57,7 @@ export interface BillingQueue {
 export interface BillingDeviceInfo {
   id: string;
   name: string;
+  tenant?: { id: string; name: string; slug: string };
   customerCount: number;
   activeCount: number;
   invoiceCount: number;

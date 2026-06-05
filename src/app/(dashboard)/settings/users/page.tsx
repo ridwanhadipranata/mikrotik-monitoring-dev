@@ -18,9 +18,8 @@ interface User {
 }
 
 const ROLES = [
-  { value: "admin", label: "Administrator", color: "var(--blue)", desc: "Akses penuh ke semua fitur" },
-  { value: "teknisi", label: "Teknisi", color: "var(--orange)", desc: "Dashboard, Status Client, WAN Traffic, Alerts, Settings" },
-  { value: "admin_pembayaran", label: "Admin Pembayaran", color: "var(--green)", desc: "Akses ke Billing saja" },
+  { value: "admin", label: "Administrator", color: "var(--blue)", desc: "Akses penuh ke semua fitur billing dan management" },
+  { value: "staff", label: "Staff", color: "var(--green)", desc: "Akses ke dashboard, monitoring, dan billing (read-only)" },
 ];
 
 function getApiBase() {
@@ -39,14 +38,16 @@ export default function UsersPage() {
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
   const [showPassword, setShowPassword] = useState(false);
-  const currentUser = getStoredUser();
+  const [currentUser, setCurrentUser] = useState<{ username: string; role: string } | null>(null);
 
-  // Only admin can access
+  // Only admin/superadmin can access
   useEffect(() => {
-    if (currentUser?.role !== "admin") {
+    const user = getStoredUser();
+    setCurrentUser(user);
+    if (!user || (user.role !== "admin" && user.role !== "superadmin")) {
       router.replace("/settings");
     }
-  }, []);
+  }, [router]);
 
   const load = async () => {
     try {
@@ -178,7 +179,7 @@ export default function UsersPage() {
           <div className="card w-full max-w-[440px] p-6 !rounded-2xl shadow-[var(--shadow-xl)] anim-scale" onClick={e => e.stopPropagation()}>
             <div className="flex items-center justify-between mb-5">
               <h2 className="text-[17px] font-bold text-[var(--text-primary)]">{editUser ? "Edit User" : "Tambah User"}</h2>
-              <button onClick={() => setShowForm(false)} className="w-8 h-8 rounded-lg flex items-center justify-center hover:bg-[var(--bg-hover)]"><X className="w-4 h-4 text-[var(--text-tertiary)]" /></button>
+              <button onClick={() => setShowForm(false)} aria-label="Tutup" className="w-8 h-8 rounded-lg flex items-center justify-center hover:bg-[var(--bg-hover)]"><X className="w-4 h-4 text-[var(--text-tertiary)]" /></button>
             </div>
 
             {error && <div className="mb-4 p-3 rounded-xl bg-[var(--red-soft)] text-[13px] text-[var(--red)] font-medium flex items-center gap-2"><AlertCircle className="w-4 h-4" />{error}</div>}

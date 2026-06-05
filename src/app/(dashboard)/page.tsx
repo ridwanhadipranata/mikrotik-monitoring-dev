@@ -10,6 +10,7 @@ import { DeviceSelector } from "@/components/dashboard/DeviceSelector";
 import { DeviceInfoCard } from "@/components/dashboard/DeviceInfoCard";
 import { QuickActions } from "@/components/dashboard/QuickActions";
 import { MikrotikAPI } from "@/lib/api";
+import { authFetch } from "@/lib/auth";
 import type { MikrotikDevice } from "@/lib/types";
 import { formatPercent, formatBytes, formatBits } from "@/lib/utils";
 import type { SystemResource, InterfaceInfo, TrafficDataPoint } from "@/lib/types";
@@ -35,6 +36,11 @@ export default function DashboardPage() {
   const [connected, setConnected] = useState<boolean | null>(null);
   const [wanTraffic, setWanTraffic] = useState<{ rx: number; tx: number; interface: string | null }>({ rx: 0, tx: 0, interface: null });
   const apiRef = useRef<MikrotikAPI | null>(null);
+  const resourceRef = useRef<SystemResource | null>(null);
+  const fetchDataRef = useRef(0);
+
+  // Keep resourceRef in sync
+  useEffect(() => { resourceRef.current = resource; }, [resource]);
 
   // Fetch devices list from API on mount
   useEffect(() => {
@@ -60,16 +66,19 @@ export default function DashboardPage() {
 
   const fetchData = useCallback(async () => {
     if (!apiRef.current || !selectedDevice) return;
+    const callId = ++fetchDataRef.current;
     try {
       const API_BASE = `${window.location.origin}/monitoring`;
       const [newResource, newInterfaces, wanRes] = await Promise.all([
         apiRef.current.getSystemResource(),
         apiRef.current.getInterfaces(),
-        fetch(`${API_BASE}/api/wan-traffic?device=${selectedDevice}`, { cache: "no-store" })
+        authFetch(`${API_BASE}/api/wan-traffic?device=${selectedDevice}`, { cache: "no-store" })
           .then(r => r.ok ? r.json() : null)
           .catch(() => null),
       ]);
-      setPrevResource(resource);
+      // Guard: only update if this is still the latest call
+      if (callId !== fetchDataRef.current) return;
+      setPrevResource(resourceRef.current);
       setResource(newResource);
       setInterfaces(newInterfaces);
 
@@ -93,11 +102,13 @@ export default function DashboardPage() {
       setError(null);
       setConnected(true);
     } catch (err: any) {
+      // Guard: only update error if this is still the latest call
+      if (callId !== fetchDataRef.current) return;
       console.error("Failed to fetch data:", err);
       setError(err.message || "Connection failed");
       setConnected(false);
     }
-  }, [resource, selectedDevice]);
+  }, [selectedDevice]);
 
   useEffect(() => {
     fetchData();
@@ -168,6 +179,11 @@ export default function DashboardPage() {
   return (
     <>
       <Header title="Dashboard" subtitle="Real-time network monitoring" />
+
+      {/* Accessibility: announce connection status changes */}
+      <div aria-live="polite" aria-atomic="true" className="sr-only">
+        {connected === false && "Koneksi terputus. Mencoba menghubungkan kembali."}
+      </div>
 
       <div className="p-4 md:p-6 space-y-5">
         {/* Top Bar */}

@@ -44,7 +44,11 @@ export default function LoginPage() {
     const saved = localStorage.getItem("theme") as Theme | null;
     if (saved) { setTheme(saved); applyTheme(saved); }
     else applyTheme("system");
-    if (isAuthenticated()) window.location.href = "/monitoring";
+    if (isAuthenticated()) {
+      const params = new URLSearchParams(window.location.search);
+      const returnUrl = params.get("return") || "/monitoring";
+      window.location.href = returnUrl;
+    }
   }, []);
 
   useEffect(() => {

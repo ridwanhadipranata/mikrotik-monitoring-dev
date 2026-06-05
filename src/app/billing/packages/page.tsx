@@ -114,7 +114,7 @@ export default function PackagesPage() {
               </div>
               <div className="space-y-1.5">
                 <label className="text-[13px] font-semibold text-[var(--text-secondary)]">Harga / Bulan (Rp)</label>
-                <input type="number" placeholder="150000" value={form.price} onChange={e => setForm({...form, price: e.target.value})} />
+                <input type="number" placeholder="150000" min="0" step="1000" value={form.price} onChange={e => setForm({...form, price: e.target.value})} />
               </div>
               <div className="space-y-1.5">
                 <label className="text-[13px] font-semibold text-[var(--text-secondary)]">Keterangan</label>

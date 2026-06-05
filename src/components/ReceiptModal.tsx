@@ -5,6 +5,9 @@ import { X, Download, Share2, FileImage, FileText, CheckCircle2, MessageCircle, 
 
 const fmtRp = (n: number) => new Intl.NumberFormat("id-ID", { style: "currency", currency: "IDR", minimumFractionDigits: 0 }).format(n);
 
+// Sanitize text for canvas rendering and sharing
+const sanitizeText = (s: string, maxLen = 100): string => s.replace(/[<>"'&]/g, "").slice(0, maxLen);
+
 export interface ReceiptData {
   customerName: string;
   packageName: string;
@@ -30,7 +33,7 @@ function loadLogo(): Promise<HTMLImageElement | null> {
     const img = new Image();
     img.onload = () => { logoCache = img; resolve(img); };
     img.onerror = () => resolve(null);
-    img.src = "/monitoring/logo.png";
+    img.src = `/monitoring/logo.png?v=${Date.now()}`;
   });
 }
 
@@ -157,10 +160,10 @@ async function renderReceiptCanvas(r: ReceiptData): Promise<HTMLCanvasElement> {
   }
   y += 20;
 
-  row("Pelanggan", r.customerName, y, "#6b7280", "#111827", true); y += lineHeight;
-  row("Paket", r.packageName, y); y += lineHeight;
-  row("Periode", r.period, y); y += lineHeight;
-  row("Tanggal Bayar", r.paidDate, y); y += lineHeight;
+  row("Pelanggan", sanitizeText(r.customerName), y, "#6b7280", "#111827", true); y += lineHeight;
+  row("Paket", sanitizeText(r.packageName), y); y += lineHeight;
+  row("Periode", sanitizeText(r.period), y); y += lineHeight;
+  row("Tanggal Bayar", sanitizeText(r.paidDate), y); y += lineHeight;
 
   y += 10; drawLine(y, true); y += 16;
   row("Tagihan Pokok", fmtRp(r.baseAmount), y); y += lineHeight;
@@ -183,6 +186,13 @@ export default function ReceiptModal({ receipt, onClose }: ReceiptModalProps) {
   const [previewUrl, setPreviewUrl] = useState<string>("");
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
+  // Handle Escape key
+  useEffect(() => {
+    const handleEscape = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    document.addEventListener("keydown", handleEscape);
+    return () => document.removeEventListener("keydown", handleEscape);
+  }, [onClose]);
+
   useEffect(() => {
     let cancelled = false;
     renderReceiptCanvas(receipt).then(canvas => {
@@ -196,10 +206,10 @@ export default function ReceiptModal({ receipt, onClose }: ReceiptModalProps) {
   const receiptText = [
     `✅ BUKTI PEMBAYARAN`,
     `━━━━━━━━━━━━━━━━━━`,
-    `👤 Pelanggan: ${receipt.customerName}`,
-    `📦 Paket: ${receipt.packageName}`,
-    `📅 Periode: ${receipt.period}`,
-    `📆 Tanggal Bayar: ${receipt.paidDate}`,
+    `👤 Pelanggan: ${sanitizeText(receipt.customerName)}`,
+    `📦 Paket: ${sanitizeText(receipt.packageName)}`,
+    `📅 Periode: ${sanitizeText(receipt.period)}`,
+    `📆 Tanggal Bayar: ${sanitizeText(receipt.paidDate)}`,
     `──────────────────`,
     `Tagihan Pokok: ${fmtRp(receipt.baseAmount)}`,
     `PPN 11%: ${fmtRp(receipt.ppn)}`,
@@ -276,7 +286,7 @@ export default function ReceiptModal({ receipt, onClose }: ReceiptModalProps) {
             <CheckCircle2 className="w-5 h-5 text-[var(--green)]" />
             <h2 className="text-[16px] font-bold text-[var(--text-primary)]">Pembayaran Berhasil!</h2>
           </div>
-          <button onClick={onClose} className="w-8 h-8 rounded-lg flex items-center justify-center hover:bg-[var(--bg-hover)]">
+          <button onClick={onClose} aria-label="Tutup" className="w-8 h-8 rounded-lg flex items-center justify-center hover:bg-[var(--bg-hover)]">
             <X className="w-4 h-4 text-[var(--text-tertiary)]" />
           </button>
         </div>

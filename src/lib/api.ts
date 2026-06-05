@@ -1,7 +1,10 @@
 import type { SystemResource, InterfaceInfo, TrafficDataPoint, MikrotikDevice } from "./types";
+import { authFetch } from "./auth";
 
 // Backend API URL - always use /monitoring prefix so Nginx proxy works
-const API_BASE = typeof window !== "undefined" ? `${window.location.origin}/monitoring` : "http://localhost:3457";
+const API_BASE = typeof window !== "undefined"
+  ? `${window.location.origin}/monitoring`
+  : (process.env.NEXT_PUBLIC_API_URL || "http://localhost:3457");
 
 export class MikrotikAPI {
   private deviceId: string;
@@ -12,9 +15,9 @@ export class MikrotikAPI {
     this.deviceId = deviceId;
   }
 
-  // Fetch available devices from backend
+  // Fetch available devices from backend (tenant-scoped)
   static async getDevices(): Promise<MikrotikDevice[]> {
-    const res = await fetch(`${API_BASE}/api/devices`, { cache: "no-store" });
+    const res = await authFetch(`${API_BASE}/api/devices`, { cache: "no-store" });
     if (!res.ok) throw new Error("Failed to fetch devices");
     const data = await res.json();
     return data.map((d: any) => ({
@@ -26,6 +29,7 @@ export class MikrotikAPI {
       password: "",
       status: d.status || "connecting",
       lastSeen: d.lastSeen ? new Date(d.lastSeen) : undefined,
+      tenant: d.tenant || null,
     }));
   }
 
@@ -34,7 +38,7 @@ export class MikrotikAPI {
   }
 
   async getSystemResource(): Promise<SystemResource> {
-    const res = await fetch(`${API_BASE}/api/resource${this.params()}`, { cache: "no-store" });
+    const res = await authFetch(`${API_BASE}/api/resource${this.params()}`, { cache: "no-store" });
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
       throw new Error(err.details || "Failed to fetch system resource");
@@ -43,6 +47,8 @@ export class MikrotikAPI {
 
     return {
       cpuLoad: data.cpuLoad,
+      cpuCount: data.cpuCount || 1,
+      cpuFrequency: data.cpuFrequency || 0,
       totalMemory: data.totalMemory,
       freeMemory: data.freeMemory,
       usedMemory: data.usedMemory,
@@ -51,77 +57,64 @@ export class MikrotikAPI {
       usedDisk: data.usedDisk,
       freeDisk: data.freeDisk,
       diskPercent: data.diskPercent,
-      uptime: parseUptime(data.uptime),
+      uptime: data.uptime,
       boardName: data.boardName,
       version: data.version,
       architecture: data.architecture,
-      cpuCount: data.cpuCount,
-      cpuFrequency: data.cpuFrequency,
-      temperature: data.temperature ?? null,
-      voltage: data.voltage ?? null,
-      name: data.name ?? "Mikrotik",
+      temperature: data.temperature,
+      voltage: data.voltage,
+      name: data.name,
     };
   }
 
   async getInterfaces(): Promise<InterfaceInfo[]> {
-    const res = await fetch(`${API_BASE}/api/interfaces${this.params()}`, { cache: "no-store" });
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      throw new Error(err.details || "Failed to fetch interfaces");
-    }
+    const res = await authFetch(`${API_BASE}/api/interfaces${this.params()}`, { cache: "no-store" });
+    if (!res.ok) throw new Error("Failed to fetch interfaces");
     const data = await res.json();
-    return Array.isArray(data) ? data : data.interfaces || [];
+    return data.interfaces || [];
   }
 
-  async getTrafficHistory(): Promise<TrafficDataPoint[]> {
-    return this.trafficHistory;
-  }
+  async getTraffic(): Promise<{ rx: number; tx: number }> {
+    const res = await authFetch(`${API_BASE}/api/wan-traffic${this.params()}`, { cache: "no-store" });
+    if (!res.ok) return { rx: 0, tx: 0 };
+    const data = await res.json();
 
-  addTrafficPoint(interfaces: InterfaceInfo[]) {
-    const totalRx = interfaces.reduce((s, i) => s + i.rxRate, 0);
-    const totalTx = interfaces.reduce((s, i) => s + i.txRate, 0);
-
-    const now = new Date();
     const point: TrafficDataPoint = {
-      time: now.toLocaleTimeString("en-US", {
-        hour12: false,
-        hour: "2-digit",
-        minute: "2-digit",
-        second: "2-digit",
-      }),
-      rx: totalRx,
-      tx: totalTx,
+      time: new Date().toISOString(),
+      rx: data.rx || 0,
+      tx: data.tx || 0,
     };
-
     this.trafficHistory.push(point);
     if (this.trafficHistory.length > this.maxHistory) {
       this.trafficHistory.shift();
     }
-    return this.trafficHistory;
+
+    return { rx: data.rx || 0, tx: data.tx || 0 };
   }
 
-  async testConnection(): Promise<boolean> {
-    try {
-      const res = await fetch(`${API_BASE}/api/ping${this.params()}`);
-      return res.ok;
-    } catch {
-      return false;
+  getTrafficHistory(): TrafficDataPoint[] {
+    return [...this.trafficHistory];
+  }
+
+  addTrafficPoint(interfaces: any[]): TrafficDataPoint[] {
+    const wanInterface = interfaces.find(i => i.type === "ether" && i.status === "up");
+    if (!wanInterface) return this.trafficHistory;
+
+    const point: TrafficDataPoint = {
+      time: new Date().toISOString(),
+      rx: wanInterface.rxBytes || 0,
+      tx: wanInterface.txBytes || 0,
+    };
+    this.trafficHistory.push(point);
+    if (this.trafficHistory.length > this.maxHistory) {
+      this.trafficHistory.shift();
     }
+    return [...this.trafficHistory];
   }
-}
 
-function parseUptime(uptime: string): number {
-  if (!uptime) return 0;
-  let totalSeconds = 0;
-  const weekMatch = uptime.match(/(\d+)w/);
-  const dayMatch = uptime.match(/(\d+)d/);
-  const timeMatch = uptime.match(/(\d+):(\d+):(\d+)/);
-  if (weekMatch) totalSeconds += parseInt(weekMatch[1]) * 7 * 86400;
-  if (dayMatch) totalSeconds += parseInt(dayMatch[1]) * 86400;
-  if (timeMatch) {
-    totalSeconds += parseInt(timeMatch[1]) * 3600;
-    totalSeconds += parseInt(timeMatch[2]) * 60;
-    totalSeconds += parseInt(timeMatch[3]);
+  async getConnectionState(): Promise<{ status: string; latency: number }> {
+    const res = await authFetch(`${API_BASE}/api/connection${this.params()}`, { cache: "no-store" });
+    if (!res.ok) return { status: "disconnected", latency: 0 };
+    return res.json();
   }
-  return totalSeconds;
 }

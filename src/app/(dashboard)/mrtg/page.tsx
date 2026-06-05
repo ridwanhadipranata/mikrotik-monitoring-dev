@@ -4,6 +4,7 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { Header } from "@/components/layout/Header";
 import { DeviceSelector } from "@/components/dashboard/DeviceSelector";
 import { MikrotikAPI } from "@/lib/api";
+import { authFetch } from "@/lib/auth";
 import { cn } from "@/lib/utils";
 import type { MikrotikDevice } from "@/lib/types";
 import {
@@ -92,7 +93,7 @@ export default function MrtgPage() {
     if (!selectedDevice) return;
     try {
       const API_BASE = `${window.location.origin}/monitoring`;
-      const res = await fetch(`${API_BASE}/api/mrtg?device=${selectedDevice}&range=${range}`, { cache: "no-store" });
+      const res = await authFetch(`${API_BASE}/api/mrtg?device=${selectedDevice}&range=${range}`, { cache: "no-store" });
       if (!res.ok) return;
       const json = await res.json();
       setData(json.points || []);

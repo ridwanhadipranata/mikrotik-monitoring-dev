@@ -7,6 +7,7 @@ export interface AuthUser {
   username: string;
   role: string;
   name: string;
+  tenantId?: string;
 }
 
 export interface AuthState {
@@ -120,6 +121,8 @@ export async function logout(): Promise<void> {
 
 // ── Authenticated Fetch Helper ─────────────────────────────────
 
+let isRedirecting = false;
+
 export function authFetch(url: string, options: RequestInit = {}): Promise<Response> {
   const token = getToken();
   const headers: Record<string, string> = {
@@ -129,7 +132,8 @@ export function authFetch(url: string, options: RequestInit = {}): Promise<Respo
     headers["Authorization"] = `Bearer ${token}`;
   }
   return fetch(url, { ...options, headers }).then(res => {
-    if (res.status === 401) {
+    if (res.status === 401 && !isRedirecting) {
+      isRedirecting = true;
       removeToken();
       if (typeof window !== "undefined") window.location.href = "/monitoring/login";
     }

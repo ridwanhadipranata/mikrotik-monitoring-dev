@@ -147,8 +147,14 @@ export default function CustomersPage() {
     loadQueues();
   };
 
+  const validatePhone = (phone: string): boolean => {
+    if (!phone) return true; // Optional field
+    return /^(08|\+?62)\d{8,13}$/.test(phone.replace(/[\s-]/g, ""));
+  };
+
   const handleSave = async () => {
     if (!form.name || !form.packageId || !form.simpleQueue) { setError("Nama, paket, dan simple queue wajib diisi"); return; }
+    if (form.phone && !validatePhone(form.phone)) { setError("Nomor telepon tidak valid. Gunakan format 08xxx atau +62xxx"); return; }
     setSaving(true); setError("");
     try {
       const data = { name: form.name, address: form.address, phone: form.phone, packageId: form.packageId, simpleQueue: form.simpleQueue, billingDay: Number(form.billingDay), status: form.status as BillingCustomer["status"], installDate: form.installDate, lat: form.lat, lng: form.lng, deviceId: device };
@@ -177,7 +183,7 @@ export default function CustomersPage() {
   };
 
   return (
-    <div className="p-5 sm:p-8 space-y-6 max-w-[1200px] mx-auto">
+    <div className="p-5 sm:p-8 space-y-6 w-full">
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
         <div className="flex items-center gap-3">
           <Link href="/billing" className="w-9 h-9 rounded-xl flex items-center justify-center hover:bg-[var(--bg-hover)] transition-colors">

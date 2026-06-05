@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { BillingAPI } from "@/lib/billing-api";
 import type { BillingInvoice, BillingCustomer, BillingPackage } from "@/lib/billing-types";
 import { getEffectiveDiscount, getEffectiveTotal } from "@/lib/billing-types";
@@ -31,6 +31,13 @@ export default function CustomerDetailModal({ customer, invoices, packages, onCl
   const [receipt, setReceipt] = useState<any>(null);
   const [confirmAction, setConfirmAction] = useState<{ type: string; invId: string } | null>(null);
   const [showAll, setShowAll] = useState(false);
+
+  // Handle Escape key
+  useEffect(() => {
+    const handleEscape = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    document.addEventListener("keydown", handleEscape);
+    return () => document.removeEventListener("keydown", handleEscape);
+  }, [onClose]);
 
   const pkg = packages.find(p => p.id === customer.packageId);
   const customerInvoices = invoices
@@ -85,14 +92,18 @@ export default function CustomerDetailModal({ customer, invoices, packages, onCl
 
   const handlePayAll = async () => {
     if (!confirm(`Bayar semua ${unpaid.length} tagihan ${customer.name}?`)) return;
-    try {
-      const paidDate = new Date().toISOString().slice(0, 10);
-      for (const inv of unpaid) {
+    const paidDate = new Date().toISOString().slice(0, 10);
+    const results = await Promise.allSettled(
+      unpaid.map(inv => {
         const effDisc = getEffectiveDiscount(inv);
-        await BillingAPI.updateInvoice(inv.id, { status: "paid", paidDate, discount: effDisc });
-      }
-      onUpdate();
-    } catch (e: any) { alert("Gagal: " + e.message); }
+        return BillingAPI.updateInvoice(inv.id, { status: "paid", paidDate, discount: effDisc });
+      })
+    );
+    const failed = results.filter(r => r.status === "rejected").length;
+    if (failed > 0) {
+      alert(`${unpaid.length - failed} berhasil, ${failed} gagal. Silakan coba lagi.`);
+    }
+    onUpdate();
   };
 
   const onPaid = () => { setPayInvoice(null); onUpdate(); };
@@ -133,7 +144,7 @@ export default function CustomerDetailModal({ customer, invoices, packages, onCl
               <p className="text-[13px] text-[var(--text-secondary)]">{pkg?.name || "-"} · {customer.simpleQueue}</p>
             </div>
           </div>
-          <button onClick={onClose} className="w-8 h-8 rounded-lg flex items-center justify-center hover:bg-[var(--bg-hover)]">
+          <button onClick={onClose} aria-label="Tutup" className="w-8 h-8 rounded-lg flex items-center justify-center hover:bg-[var(--bg-hover)]">
             <X className="w-4 h-4 text-[var(--text-tertiary)]" />
           </button>
         </div>

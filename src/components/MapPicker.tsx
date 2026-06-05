@@ -4,7 +4,13 @@ import { useEffect, useRef, useState, useCallback } from "react";
 import L from "leaflet";
 import "leaflet/dist/leaflet.css";
 
-// Fix default markers in Next.js
+// Escape HTML to prevent XSS
+function escapeHtml(str: string): string {
+  return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;");
+}
+
+// Workaround for Leaflet default marker icons in Next.js/webpack
+// See: https://github.com/Leaflet/Leaflet/issues/4968
 delete (L.Icon.Default.prototype as any)._getIconUrl;
 L.Icon.Default.mergeOptions({
   iconRetinaUrl: "https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon-2x.png",
@@ -146,6 +152,10 @@ export default function MapPicker({
         c.status === "active" ? "#34C759" :
         c.status === "suspended" ? "#FF9500" : "#FF3B30";
 
+      const safeName = escapeHtml(c.name);
+      const safeQueue = escapeHtml(c.simpleQueue);
+      const safePhone = escapeHtml(c.phone);
+
       const icon = L.divIcon({
         className: "",
         html: `<div style="
@@ -156,7 +166,7 @@ export default function MapPicker({
           display:flex;align-items:center;justify-content:center;
           font-family:-apple-system,sans-serif;
           transition:transform 0.2s;
-        "><span style="color:white;font-size:13px;font-weight:700;">${c.name.charAt(0).toUpperCase()}</span></div>`,
+        "><span style="color:white;font-size:13px;font-weight:700;">${escapeHtml(c.name.charAt(0).toUpperCase())}</span></div>`,
         iconSize: [32, 32],
         iconAnchor: [16, 16],
         popupAnchor: [0, -18],
@@ -167,16 +177,16 @@ export default function MapPicker({
         `<div style="font-family:-apple-system,sans-serif;min-width:200px;padding:4px 0;">
           <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
             <div style="width:32px;height:32px;border-radius:50%;background:${color};display:flex;align-items:center;justify-content:center;">
-              <span style="color:white;font-size:14px;font-weight:700;">${c.name.charAt(0).toUpperCase()}</span>
+              <span style="color:white;font-size:14px;font-weight:700;">${escapeHtml(c.name.charAt(0).toUpperCase())}</span>
             </div>
             <div>
-              <p style="font-weight:700;font-size:14px;margin:0;color:#1d1d1f;">${c.name}</p>
+              <p style="font-weight:700;font-size:14px;margin:0;color:#1d1d1f;">${safeName}</p>
               <span style="font-size:11px;color:${color};font-weight:600;">${c.status === "active" ? "● Aktif" : c.status === "suspended" ? "● Suspended" : "● Putus"}</span>
             </div>
           </div>
           <div style="border-top:1px solid #f0f0f0;padding-top:8px;font-size:12px;color:#6e6e73;">
-            <p style="margin:0 0 3px;">📶 Queue: <strong style="color:#1d1d1f;">${c.simpleQueue}</strong></p>
-            ${c.phone ? `<p style="margin:0 0 3px;">📞 ${c.phone}</p>` : ""}
+            <p style="margin:0 0 3px;">📶 Queue: <strong style="color:#1d1d1f;">${safeQueue}</strong></p>
+            ${c.phone ? `<p style="margin:0 0 3px;">📞 ${safePhone}</p>` : ""}
             <p style="margin:0;color:#007AFF;font-size:11px;">📍 ${c.lat!.toFixed(6)}, ${c.lng!.toFixed(6)}</p>
           </div>
         </div>`,
@@ -211,11 +221,12 @@ export default function MapPicker({
 
   // ── Search address ──────────────────────────────────────────
   const handleSearch = async () => {
-    if (!searchQuery.trim()) return;
+    if (!searchQuery.trim() || searching) return;
     setSearching(true);
     try {
       const res = await fetch(
-        `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(searchQuery)}&limit=1`
+        `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(searchQuery)}&limit=1`,
+        { headers: { "Accept-Language": "id" } }
       );
       const data = await res.json();
       if (data?.length > 0) {
@@ -274,6 +285,7 @@ export default function MapPicker({
                      border border-[var(--border)] shadow-[var(--shadow-md)]
                      text-[var(--text-primary)]
                      hover:shadow-[var(--shadow-lg)] active:scale-95 transition-all"
+          aria-label={satellite ? "Switch to Street map" : "Switch to Satellite view"}
           title={satellite ? "Switch to Street" : "Switch to Satellite"}
         >
           <span className="text-[14px]">{satellite ? "🗺️" : "🛰️"}</span>

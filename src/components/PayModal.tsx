@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { BillingAPI } from "@/lib/billing-api";
 import type { BillingInvoice, BillingCustomer } from "@/lib/billing-types";
 import { getEffectiveDiscount } from "@/lib/billing-types";
@@ -23,17 +23,31 @@ interface PayModalProps {
 }
 
 export default function PayModal({ invoice, customerName, customer, packageName, packageSpeed, onClose, onPaid }: PayModalProps) {
-  // Discount policy: current month = PPN if 1-10, past month = no discount
-  const today = new Date().getDate();
-  const effectiveFromHelper = getEffectiveDiscount(invoice);
-  const defaultDiscount = invoice.discount > 0 ? invoice.discount : effectiveFromHelper;
+  // Memoize initial discount state to avoid recomputation on every render
+  const [initialState] = useState(() => {
+    const today = new Date().getDate();
+    const effectiveFromHelper = getEffectiveDiscount(invoice);
+    const defaultDiscount = invoice.discount > 0 ? invoice.discount : effectiveFromHelper;
+    return {
+      discount: defaultDiscount,
+      discountInput: String(defaultDiscount),
+      discountRemoved: invoice.discount === 0 && today > 10,
+    };
+  });
 
-  const [discount, setDiscount] = useState(defaultDiscount);
-  const [discountInput, setDiscountInput] = useState(String(defaultDiscount));
-  const [discountRemoved, setDiscountRemoved] = useState(invoice.discount === 0 && today > 10);
+  const [discount, setDiscount] = useState(initialState.discount);
+  const [discountInput, setDiscountInput] = useState(initialState.discountInput);
+  const [discountRemoved, setDiscountRemoved] = useState(initialState.discountRemoved);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const [receipt, setReceipt] = useState<ReceiptData | null>(null);
+
+  // Handle Escape key
+  useEffect(() => {
+    const handleEscape = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    document.addEventListener("keydown", handleEscape);
+    return () => document.removeEventListener("keydown", handleEscape);
+  }, [onClose]);
 
   const baseAmount = invoice.amount;
   const ppn = Math.round(baseAmount * 0.11);
@@ -41,6 +55,7 @@ export default function PayModal({ invoice, customerName, customer, packageName,
   const total = baseAmount + ppn - effectiveDiscount;
   // Discount is available only if: current/future month AND today is 1-10
   const now = new Date();
+  const today = now.getDate();
   const isCurrentOrFuture = invoice.year > now.getFullYear() || (invoice.year === now.getFullYear() && invoice.month >= now.getMonth() + 1);
   const isDiscountPeriod = isCurrentOrFuture && today <= 10;
 
@@ -95,7 +110,7 @@ export default function PayModal({ invoice, customerName, customer, packageName,
             <Receipt className="w-5 h-5 text-[var(--blue)]" />
             <h2 className="text-[16px] font-bold text-[var(--text-primary)]">Pembayaran Tagihan</h2>
           </div>
-          <button onClick={onClose} className="w-8 h-8 rounded-lg flex items-center justify-center hover:bg-[var(--bg-hover)]">
+          <button onClick={onClose} aria-label="Tutup" className="w-8 h-8 rounded-lg flex items-center justify-center hover:bg-[var(--bg-hover)]">
             <X className="w-4 h-4 text-[var(--text-tertiary)]" />
           </button>
         </div>

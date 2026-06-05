@@ -114,7 +114,7 @@ export default function MonthlyPage() {
   };
 
   return (
-    <div className="p-5 sm:p-8 space-y-6 max-w-[1200px] mx-auto">
+    <div className="p-5 sm:p-8 space-y-6 w-full">
       {/* Header */}
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
         <div className="flex items-center gap-3">
@@ -270,12 +270,16 @@ export default function MonthlyPage() {
                               <td className="text-right">
                                 <div className="flex gap-1 justify-end">
                                   <button
-                                    onClick={() => sendInvoiceWhatsApp({
+                                    onClick={() => {
+                                      const cust = customers.find(c => c.id === inv.customerId);
+                                      if (!cust) return;
+                                      sendInvoiceWhatsApp({
                                       invoice: inv,
-                                      customer: customers.find(c => c.id === inv.customerId)!,
+                                      customer: cust,
                                       packageName: getCustomerPackage(inv.customerId),
                                       packageSpeed: getCustomerPackageSpeed(inv.customerId),
-                                    })}
+                                    });
+                                    }}
                                     className="btn !px-2.5 !py-1 !text-[11px] !rounded-lg bg-[#25D366]/10 text-[#25D366] hover:bg-[#25D366]/20"
                                     title="Kirim via WhatsApp"
                                   >

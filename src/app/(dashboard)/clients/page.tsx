@@ -4,6 +4,7 @@ import { useState, useEffect, useCallback } from "react";
 import { Header } from "@/components/layout/Header";
 import { DeviceSelector } from "@/components/dashboard/DeviceSelector";
 import { MikrotikAPI } from "@/lib/api";
+import { authFetch } from "@/lib/auth";
 import { cn } from "@/lib/utils";
 import type { MikrotikDevice } from "@/lib/types";
 import {
@@ -40,8 +41,10 @@ interface Client {
 interface StatusLogEntry {
   status: "up" | "down" | "disabled";
   changedAt: number;
+  latency?: number | null;
 }
 type StatusLog = Record<string, StatusLogEntry>;
+type StatusLogHistory = Record<string, StatusLogEntry[]>;
 
 interface ClientsData {
   total: number;
@@ -68,27 +71,64 @@ export default function ClientsPage() {
   const [lastRefresh, setLastRefresh] = useState<Date | null>(null);
   const [lastPing, setLastPing] = useState<Date | null>(null);
   const [statusLog, setStatusLog] = useState<StatusLog>({});
+  const [statusLogHistory, setStatusLogHistory] = useState<StatusLogHistory>({});
+  const [selectedClientLog, setSelectedClientLog] = useState<string | null>(null);
   const [switching, setSwitching] = useState(false);
 
   // Load status log from server (background bot)
   useEffect(() => {
     const fetchStatusLog = async () => {
       try {
-        const res = await fetch("/monitoring/api/status-log", { cache: "no-store" });
+        const res = await authFetch("/monitoring/api/status-log", { cache: "no-store" });
         if (res.ok) {
           const data = await res.json();
           if (data.current) {
             const mapped: StatusLog = {};
-            for (const [key, entry] of Object.entries(data.current) as any) {
+            for (const [key, entry] of Object.entries(data.current) as [string, StatusLogEntry][]) {
               const parts = key.split(":");
+              if (parts.length < 2) continue;
               const name = parts.slice(1).join(":");
-              if (name) {
+              if (name && entry.status && entry.changedAt) {
                 if (!mapped[name] || entry.changedAt > mapped[name].changedAt) {
-                  mapped[name] = { status: entry.status, changedAt: entry.changedAt };
+                  mapped[name] = { status: entry.status, changedAt: entry.changedAt, latency: entry.latency };
                 }
               }
             }
             setStatusLog(mapped);
+
+            // Merge bot status into client data
+            setData(prev => {
+              if (!prev) return prev;
+              let changed = false;
+              const updated = prev.clients.map(c => {
+                const entry = mapped[c.name];
+                if (entry) {
+                  const alive = entry.status === "up";
+                  const latency = entry.latency ?? c.latency;
+                  if (c.alive !== alive || c.latency !== latency) {
+                    changed = true;
+                    return { ...c, alive, latency };
+                  }
+                }
+                return c;
+              });
+              if (!changed) return prev;
+              const up = updated.filter(c => c.alive && !c.disabled);
+              const down = updated.filter(c => !c.alive && !c.disabled);
+              const disabled = updated.filter(c => c.disabled);
+              return { total: updated.length, up: up.length, down: down.length, disabled: disabled.length, clients: [...down, ...up, ...disabled], groups: { down, up, disabled } };
+            });
+          }
+          if (data.logs) {
+            const mappedHistory: StatusLogHistory = {};
+            for (const [key, entries] of Object.entries(data.logs) as any) {
+              const parts = key.split(":");
+              const name = parts.slice(1).join(":");
+              if (name && Array.isArray(entries)) {
+                mappedHistory[name] = entries.sort((a: StatusLogEntry, b: StatusLogEntry) => b.changedAt - a.changedAt);
+              }
+            }
+            setStatusLogHistory(mappedHistory);
           }
         }
       } catch {}
@@ -112,48 +152,26 @@ export default function ClientsPage() {
     const dev = deviceId || selectedDevice;
     if (!dev) return;
     try {
-      // Fetch queue data + bot status in parallel
-      const [queueRes, statusRes] = await Promise.all([
-        fetch(`/monitoring/api/clients?device=${dev}`, { cache: "no-store" }),
-        fetch(`/monitoring/api/status-log`, { cache: "no-store" }),
-      ]);
-
+      const queueRes = await authFetch(`/monitoring/api/clients?device=${dev}`, { cache: "no-store" });
       if (!queueRes.ok) {
         const err = await queueRes.json().catch(() => ({ error: "Gagal memuat data" }));
         throw new Error(err.error || `HTTP ${queueRes.status}`);
       }
-
       const json = await queueRes.json();
 
-      // Merge bot status to set alive state immediately
-      if (statusRes.ok) {
-        const statusData = await statusRes.json();
-        const botStatus = statusData.current || {};
-        const updatedClients = json.clients.map((c: Client) => {
-          // Try multiple key formats: "deviceId:clientName", "clientName"
-          const key1 = `${dev}:${c.name}`;
-          const key2 = c.name;
-          const entry = botStatus[key1] || botStatus[key2];
-          if (entry) {
-            const alive = entry.status === "up";
-            return { ...c, alive };
-          }
-          return c;
+      // Preserve alive/latency from previous state (bot updates via fetchStatusLog)
+      setData(prev => {
+        if (!prev) return json;
+        const prevMap = new Map(prev.clients.map(c => [c.name, c]));
+        const merged = json.clients.map((c: Client) => {
+          const p = prevMap.get(c.name);
+          return p ? { ...c, alive: p.alive, latency: p.latency } : c;
         });
-        const up = updatedClients.filter((c: Client) => c.alive && !c.disabled);
-        const down = updatedClients.filter((c: Client) => !c.alive && !c.disabled);
-        const disabled = updatedClients.filter((c: Client) => c.disabled);
-        setData({
-          total: updatedClients.length,
-          up: up.length,
-          down: down.length,
-          disabled: disabled.length,
-          clients: [...down, ...up, ...disabled],
-          groups: { down, up, disabled },
-        });
-      } else {
-        setData(json);
-      }
+        const up = merged.filter((c: Client) => c.alive && !c.disabled);
+        const down = merged.filter((c: Client) => !c.alive && !c.disabled);
+        const disabled = merged.filter((c: Client) => c.disabled);
+        return { total: merged.length, up: up.length, down: down.length, disabled: disabled.length, clients: [...down, ...up, ...disabled], groups: { down, up, disabled } };
+      });
 
       setError(null);
       setLastRefresh(new Date());
@@ -165,41 +183,8 @@ export default function ClientsPage() {
     }
   }, [selectedDevice]);
 
-  const fetchPing = useCallback(async (deviceId?: string) => {
-    const dev = deviceId || selectedDevice;
-    if (!dev) return;
-    try {
-      const res = await fetch(`/monitoring/api/clients/ping?device=${dev}`, { cache: "no-store" });
-      if (!res.ok) return;
-      const json = await res.json();
-      if (json.results) {
-        setLastPing(new Date());
-        setData(prev => {
-          if (!prev) return prev;
-          const pingResults = json.results;
-          const updatedClients = prev.clients.map(c => {
-            const clientPings = c.ips.map(ip => pingResults[ip] || { ip, alive: false, latency: null });
-            const alive = clientPings.some(p => p.alive);
-            const latency = clientPings.find(p => p.alive)?.latency ?? null;
-            return { ...c, alive, latency, pings: clientPings };
-          });
-          const up = updatedClients.filter(c => c.alive && !c.disabled);
-          const down = updatedClients.filter(c => !c.alive && !c.disabled);
-          const disabled = updatedClients.filter(c => c.disabled);
-          return {
-            total: updatedClients.length,
-            up: up.length,
-            down: down.length,
-            disabled: disabled.length,
-            clients: [...down, ...up, ...disabled],
-            groups: { down, up, disabled },
-          };
-        });
-      }
-    } catch (err) {
-      console.error("Ping fetch error:", err);
-    }
-  }, [selectedDevice]);
+  // Bot now provides all ping/latency data via status-log
+  // fetchPing is no longer needed — bot is the single source of truth
 
   // Reset data when switching device
   useEffect(() => {
@@ -208,23 +193,23 @@ export default function ClientsPage() {
       setError(null);
       setLoading(true);
       setSwitching(true);
+      setStatusLog({});
+      setStatusLogHistory({});
+      setSelectedClientLog(null);
       const dev = selectedDevice;
       const controller = new AbortController();
 
-      // Full initial load
-      fetchData(dev).then(() => fetchPing(dev));
-      // Queue data: every 5s (lightweight)
+      // Full initial load (queue only, no ping)
+      fetchData(dev);
+      // Queue data: every 10s (lightweight)
       const queueInterval = setInterval(() => {
         if (!controller.signal.aborted) fetchData(dev);
-      }, 5000);
-      // Ping data: every 60s (heavy)
-      const pingInterval = setInterval(() => {
-        if (!controller.signal.aborted) fetchPing(dev);
-      }, 60000);
+      }, 10000);
+      // Bot status: every 15s (lightweight, updates alive state)
+      // Already running via fetchStatusLog interval above
       return () => {
         controller.abort();
         clearInterval(queueInterval);
-        clearInterval(pingInterval);
       };
     }
   }, [selectedDevice]);
@@ -371,7 +356,7 @@ export default function ClientsPage() {
                 {lastRefresh.toLocaleTimeString("en-US", { hour12: false })}
               </span>
             )}
-            <button onClick={() => { fetchData(selectedDevice); fetchPing(selectedDevice); }} disabled={loading || switching} className="btn btn-secondary text-[13px]">
+            <button onClick={() => fetchData(selectedDevice)} disabled={loading || switching} className="btn btn-secondary text-[13px]">
               <RefreshCw className={cn("w-3.5 h-3.5", (loading || switching) && "animate-spin")} />
               {switching ? "Loading..." : "Refresh"}
             </button>
@@ -405,6 +390,9 @@ export default function ClientsPage() {
             highlight
             search={search}
             statusLog={statusLog}
+            statusLogHistory={statusLogHistory}
+            selectedClientLog={selectedClientLog}
+            onSelectClientLog={setSelectedClientLog}
           />
         )}
 
@@ -420,6 +408,9 @@ export default function ClientsPage() {
             onToggle={() => setExpandedUp(!expandedUp)}
             search={search}
             statusLog={statusLog}
+            statusLogHistory={statusLogHistory}
+            selectedClientLog={selectedClientLog}
+            onSelectClientLog={setSelectedClientLog}
           />
         )}
 
@@ -435,6 +426,9 @@ export default function ClientsPage() {
             onToggle={() => setExpandedDisabled(!expandedDisabled)}
             search={search}
             statusLog={statusLog}
+            statusLogHistory={statusLogHistory}
+            selectedClientLog={selectedClientLog}
+            onSelectClientLog={setSelectedClientLog}
           />
         )}
 
@@ -468,10 +462,10 @@ function SummaryCard({ icon, label, value, color }: { icon: React.ReactNode; lab
 }
 
 function ClientGroup({
-  title, subtitle, icon, badge, clients, expanded, onToggle, highlight = false, search = "", statusLog = {},
+  title, subtitle, icon, badge, clients, expanded, onToggle, highlight = false, search = "", statusLog = {}, statusLogHistory = {}, selectedClientLog = null, onSelectClientLog = () => {},
 }: {
   title: string; subtitle: string; icon: React.ReactNode; badge: string;
-  clients: Client[]; expanded: boolean; onToggle: () => void; highlight?: boolean; search?: string; statusLog?: StatusLog;
+  clients: Client[]; expanded: boolean; onToggle: () => void; highlight?: boolean; search?: string; statusLog?: StatusLog; statusLogHistory?: StatusLogHistory; selectedClientLog?: string | null; onSelectClientLog?: (name: string | null) => void;
 }) {
   return (
     <div className={cn("card overflow-hidden anim-in", highlight && "ring-1 ring-[var(--red)]/20")}>
@@ -504,31 +498,39 @@ function ClientGroup({
             </colgroup>
             <thead>
               <tr>
-                <th>Status</th>
+                <th className="text-center">Status</th>
                 <th>Nama Client</th>
                 <th>Target</th>
-                <th className="text-right">Latency</th>
-                <th className="text-right">Upload</th>
-                <th className="text-right">Download</th>
-                <th className="text-right">Total TX</th>
-                <th className="text-right">Total RX</th>
+                <th className="text-center">Latency</th>
+                <th className="text-center">Upload</th>
+                <th className="text-center">Download</th>
+                <th className="text-center">Total TX</th>
+                <th className="text-center">Total RX</th>
               </tr>
             </thead>
             <tbody>
               {clients.map((c, idx) => (
+                <>{/* @ts-ignore */}
                 <tr key={`${c.name}-${idx}`} className="anim-in" style={{ animationDelay: `${Math.min(idx * 0.02, 0.5)}s` }}>
                   <td>
-                    <div className="flex flex-col gap-0.5">
-                      <div className="flex items-center gap-2">
+                    <div className="flex flex-col items-center gap-0.5">
+                      <div className="flex items-center gap-1.5">
                         <div className={cn("dot", c.alive ? "dot-green" : c.disabled ? "bg-[var(--text-quaternary)]" : "dot-red")} />
                         <span className={cn("text-[12px] font-semibold", c.alive ? "text-[var(--green)]" : c.disabled ? "text-[var(--text-tertiary)]" : "text-[var(--red)]")}>
                           {c.disabled ? "OFF" : c.alive ? "UP" : "DOWN"}
                         </span>
                       </div>
                       {statusLog[c.name] && (
-                        <span className="text-[10px] text-[var(--text-quaternary)] ml-5 whitespace-nowrap">
+                        <button
+                          onClick={() => onSelectClientLog(selectedClientLog === c.name ? null : c.name)}
+                          className="text-[10px] text-[var(--text-quaternary)] whitespace-nowrap hover:text-[var(--text-secondary)] transition-colors cursor-pointer"
+                          title="Klik untuk lihat history"
+                        >
                           {new Date(statusLog[c.name].changedAt).toLocaleString("id-ID", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit", hour12: false })}
-                        </span>
+                          {statusLogHistory[c.name] && statusLogHistory[c.name].length > 1 && (
+                            <span className="ml-0.5 text-[var(--blue)]">({statusLogHistory[c.name].length})</span>
+                          )}
+                        </button>
                       )}
                     </div>
                   </td>
@@ -545,46 +547,75 @@ function ClientGroup({
                       <Highlight text={c.target} query={search} />
                     </span>
                   </td>
-                  <td className="text-right">
+                  <td className="text-center">
                     {c.latency !== null ? (
-                      <span className={cn("text-[13px] font-mono font-medium",
+                      <span className={cn("text-[12px] font-mono font-medium",
                         c.latency < 10 ? "text-[var(--green)]" : c.latency < 50 ? "text-[var(--orange)]" : "text-[var(--red)]"
                       )}>
                         {c.latency.toFixed(1)}ms
                       </span>
                     ) : (
-                      <span className="text-[13px] text-[var(--text-quaternary)]">—</span>
+                      <span className="text-[12px] text-[var(--text-quaternary)]">—</span>
                     )}
                   </td>
-                  <td className="text-right">
+                  <td className="text-center">
                     {c.rateUpload > 0 ? (
-                      <span className="text-[12px] font-mono font-semibold text-[var(--green)]">
+                      <span className="text-[12px] font-mono font-medium text-[var(--green)]">
                         {formatSpeed(c.rateUpload.toString())}
                       </span>
                     ) : (
                       <span className="text-[12px] text-[var(--text-quaternary)]">—</span>
                     )}
                   </td>
-                  <td className="text-right">
+                  <td className="text-center">
                     {c.rateDownload > 0 ? (
-                      <span className="text-[12px] font-mono font-semibold text-[var(--blue)]">
+                      <span className="text-[12px] font-mono font-medium text-[var(--blue)]">
                         {formatSpeed(c.rateDownload.toString())}
                       </span>
                     ) : (
                       <span className="text-[12px] text-[var(--text-quaternary)]">—</span>
                     )}
                   </td>
-                  <td className="text-right ">
-                    <span className="text-[11px] font-mono text-[var(--text-tertiary)]">
+                  <td className="text-center">
+                    <span className="text-[12px] font-mono text-[var(--text-tertiary)]">
                       {formatBytes(c.totalUpload)}
                     </span>
                   </td>
-                  <td className="text-right ">
-                    <span className="text-[11px] font-mono text-[var(--text-tertiary)]">
+                  <td className="text-center">
+                    <span className="text-[12px] font-mono text-[var(--text-tertiary)]">
                       {formatBytes(c.totalDownload)}
                     </span>
                   </td>
                 </tr>
+                {selectedClientLog === c.name && statusLogHistory[c.name] && (
+                  <tr className="bg-[var(--bg-secondary)]">
+                    <td colSpan={9} className="px-4 py-3">
+                      <div className="flex items-center gap-2 mb-2">
+                        <span className="text-[11px] font-semibold text-[var(--text-secondary)]">Status Log History:</span>
+                        <button
+                          onClick={() => onSelectClientLog(null)}
+                          className="text-[10px] text-[var(--text-quaternary)] hover:text-[var(--text-secondary)]"
+                        >
+                          ✕
+                        </button>
+                      </div>
+                      <div className="flex flex-wrap gap-2">
+                        {statusLogHistory[c.name].slice(0, 20).map((entry, i) => (
+                          <div key={i} className="flex items-center gap-1.5 px-2 py-1 rounded-md bg-[var(--bg-primary)] border border-[var(--border)]">
+                            <div className={cn("dot", entry.status === "up" ? "dot-green" : entry.status === "disabled" ? "bg-[var(--text-quaternary)]" : "dot-red")} />
+                            <span className="text-[10px] font-medium text-[var(--text-secondary)]">
+                              {entry.status.toUpperCase()}
+                            </span>
+                            <span className="text-[10px] text-[var(--text-quaternary)]">
+                              {new Date(entry.changedAt).toLocaleString("id-ID", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit", hour12: false })}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    </td>
+                  </tr>
+                )}
+                </>
               ))}
             </tbody>
           </table>

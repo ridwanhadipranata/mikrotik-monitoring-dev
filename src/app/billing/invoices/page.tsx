@@ -18,6 +18,14 @@ const DeviceSelector = dynamic(() => import("@/components/DeviceSelector"), { ss
 const CustomerDetailModal = dynamic(() => import("@/components/CustomerDetailModal"), { ssr: false });
 
 const MONTHS = ["Jan","Feb","Mar","Apr","Mei","Jun","Jul","Agu","Sep","Okt","Nov","Des"];
+const MONTHS_FULL = ["Januari","Februari","Maret","April","Mei","Juni","Juli","Agustus","September","Oktober","November","Desember"];
+
+function getYearOptions() {
+  const now = new Date();
+  const years: number[] = [];
+  for (let y = now.getFullYear() - 2; y <= now.getFullYear() + 1; y++) years.push(y);
+  return years;
+}
 
 function formatRp(n: number): string {
   return new Intl.NumberFormat("id-ID", { style: "currency", currency: "IDR", minimumFractionDigits: 0 }).format(n);
@@ -46,6 +54,7 @@ export default function InvoicesPage() {
   const [filterMonth, setFilterMonth] = useState(now.getMonth() + 1);
   const [filterYear, setFilterYear] = useState(now.getFullYear());
   const monthOptions = getMonthOptions();
+  const yearOptions = getYearOptions();
 
   const load = () => Promise.all([
     BillingAPI.getInvoices(device),
@@ -107,7 +116,7 @@ export default function InvoicesPage() {
   };
 
   return (
-    <div className="p-5 sm:p-8 space-y-6 max-w-[1200px] mx-auto">
+    <div className="p-5 sm:p-8 space-y-6 w-full">
       {/* Header */}
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
         <div className="flex items-center gap-3">
@@ -127,24 +136,26 @@ export default function InvoicesPage() {
 
       <BillingNav current="/billing/invoices" />
 
-      {/* Month Filter */}
-      <div className="flex gap-2 overflow-x-auto pb-1 scrollbar-none -mx-1 px-1">
-        {monthOptions.map(opt => {
-          const active = opt.month === filterMonth && opt.year === filterYear;
-          return (
-            <button
-              key={`${opt.month}-${opt.year}`}
-              onClick={() => { setFilterMonth(opt.month); setFilterYear(opt.year); setSelectedCustomer(null); }}
-              className={`px-4 py-2 rounded-xl text-[13px] font-semibold whitespace-nowrap transition-all ${
-                active
-                  ? "bg-[var(--blue)] text-white shadow-[0_2px_8px_rgba(0,122,255,0.25)]"
-                  : "bg-[var(--bg-card)] text-[var(--text-tertiary)] border border-[var(--border)] hover:border-[var(--blue)]/30"
-              }`}
-            >
-              {opt.label}
-            </button>
-          );
-        })}
+      {/* Month Filter — Dropdown */}
+      <div className="flex gap-2">
+        <select
+          value={filterMonth}
+          onChange={e => { setFilterMonth(Number(e.target.value)); setSelectedCustomer(null); }}
+          className="!py-3 !px-5 !text-[15px] !rounded-xl !font-semibold"
+        >
+          {MONTHS_FULL.map((m, i) => (
+            <option key={i} value={i + 1}>{m}</option>
+          ))}
+        </select>
+        <select
+          value={filterYear}
+          onChange={e => { setFilterYear(Number(e.target.value)); setSelectedCustomer(null); }}
+          className="!py-3 !px-5 !text-[15px] !rounded-xl !font-semibold"
+        >
+          {yearOptions.map(y => (
+            <option key={y} value={y}>{y}</option>
+          ))}
+        </select>
       </div>
 
       {/* Summary */}

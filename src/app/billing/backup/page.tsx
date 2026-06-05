@@ -2,15 +2,17 @@
 
 import { useState, useEffect, useRef } from "react";
 import Link from "next/link";
+import dynamic from "next/dynamic";
 import { authFetch } from "@/lib/auth";
 import { useBillingDevice } from "@/lib/use-billing-device";
-import DeviceSelector from "@/components/DeviceSelector";
 import {
   ArrowLeft, Database, Download, Upload, RefreshCw,
   CheckCircle2, AlertCircle, HardDrive, FileJson,
   Package, Users, FileText, Loader2, Info,
 } from "lucide-react";
 import BillingNav from "@/components/BillingNav";
+
+const DeviceSelector = dynamic(() => import("@/components/DeviceSelector"), { ssr: false });
 
 const fmtRp = (n: number) => new Intl.NumberFormat("id-ID", { style: "currency", currency: "IDR", minimumFractionDigits: 0 }).format(n);
 const fmtSize = (bytes: number) => {
@@ -33,7 +35,7 @@ interface BackupInfo {
   invoicesPaid: number;
   invoicesUnpaid: number;
   totalRevenue: number;
-  diskUsage: { packages: number; customers: number; invoices: number };
+  diskUsage?: { packages: number; customers: number; invoices: number };
 }
 
 interface DeviceInfo { id: string; name: string; }
@@ -98,6 +100,12 @@ export default function BackupPage() {
     const file = e.target.files?.[0];
     if (!file) return;
 
+    // Max 50MB
+    if (file.size > 50 * 1024 * 1024) {
+      setMsg({ type: "error", text: "File terlalu besar (max 50MB)" });
+      return;
+    }
+
     const reader = new FileReader();
     reader.onload = (ev) => {
       try {
@@ -151,7 +159,7 @@ export default function BackupPage() {
   };
 
   return (
-    <div className="p-5 sm:p-8 space-y-6 max-w-[1000px] mx-auto">
+    <div className="p-5 sm:p-8 space-y-6 w-full">
       {/* Header */}
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
         <div className="flex items-center gap-3">
@@ -320,7 +328,7 @@ export default function BackupPage() {
                   <span className="text-[11px] text-[var(--text-tertiary)] font-medium">Ukuran</span>
                 </div>
                 <p className="text-[20px] font-bold text-[var(--text-primary)] tabular-nums">
-                  {fmtSize(info.diskUsage.packages + info.diskUsage.customers + info.diskUsage.invoices)}
+                  {info.diskUsage ? fmtSize(info.diskUsage.packages + info.diskUsage.customers + info.diskUsage.invoices) : "—"}
                 </p>
               </div>
             </div>

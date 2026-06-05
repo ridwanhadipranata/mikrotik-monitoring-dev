@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo, useCallback } from "react";
 import Link from "next/link";
 import dynamic from "next/dynamic";
 import { BillingAPI } from "@/lib/billing-api";
@@ -49,14 +49,14 @@ export default function BillingDashboard() {
   const currentMonth = now.getMonth() + 1;
   const currentYear = now.getFullYear();
 
-  const customerStatus = customers.map(c => {
+  const customerStatus = useMemo(() => customers.map(c => {
     const pkg = packages.find(p => p.id === c.packageId);
     const customerInvoices = invoices.filter(i => i.customerId === c.id);
     const unpaid = customerInvoices.filter(i => i.status === "unpaid");
     const unpaidTotal = unpaid.reduce((s, i) => s + getEffectiveTotal(i), 0);
     const currentInvoice = customerInvoices.find(i => i.month === currentMonth && i.year === currentYear);
     return { ...c, packageName: pkg?.name || "-", packagePrice: pkg?.price || 0, unpaidCount: unpaid.length, unpaidTotal, isCurrentUnpaid: currentInvoice?.status === "unpaid", currentInvoice };
-  });
+  }), [customers, packages, invoices, currentMonth, currentYear]);
 
   const filtered = search
     ? customerStatus.filter(c => c.name.toLowerCase().includes(search.toLowerCase()) || c.simpleQueue.toLowerCase().includes(search.toLowerCase()) || (c.phone || "").includes(search) || (c.address || "").toLowerCase().includes(search.toLowerCase()))
@@ -76,7 +76,7 @@ export default function BillingDashboard() {
   if (!device) {
     return (
       <div className="min-h-screen bg-[var(--bg-base)]">
-        <div className="max-w-[1200px] mx-auto px-6 py-8 space-y-6">
+        <div className="w-full px-6 py-8 space-y-6">
           <div><h1 className="text-[26px] font-bold text-[var(--text-primary)]">Billing</h1><p className="text-[15px] text-[var(--text-tertiary)] mt-1">Pilih router untuk mulai</p></div>
           <DeviceSelector value={device} onChange={setDevice} />
         </div>

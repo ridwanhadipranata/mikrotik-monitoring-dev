@@ -3,7 +3,7 @@
 import { useState, useEffect } from "react";
 import { BillingAPI } from "@/lib/billing-api";
 import type { BillingDeviceInfo } from "@/lib/billing-types";
-import { Router, ChevronDown, Check, Users, AlertCircle } from "lucide-react";
+import { Router, ChevronDown, Check, Users, AlertCircle, Building2 } from "lucide-react";
 
 interface DeviceSelectorProps {
   value: string;
@@ -18,9 +18,14 @@ export default function DeviceSelector({ value, onChange }: DeviceSelectorProps)
   useEffect(() => {
     BillingAPI.getDevices().then(d => {
       setDevices(d);
-      // Auto-select first if nothing selected AND no saved value
+      if (d.length === 0) return;
+      // Auto-select: first load, or saved value is invalid
       const saved = typeof window !== "undefined" ? localStorage.getItem("***") : null;
-      if (!value && !saved && d.length > 0) {
+      const isValidSaved = saved && d.some(dev => dev.id === saved);
+      if (!value && !isValidSaved) {
+        onChange(d[0].id);
+      } else if (value && !d.some(dev => dev.id === value)) {
+        // Current value not in list → reset to first
         onChange(d[0].id);
       }
     }).catch(() => {}).finally(() => setLoading(false));
@@ -29,7 +34,7 @@ export default function DeviceSelector({ value, onChange }: DeviceSelectorProps)
   const selected = devices.find(d => d.id === value);
 
   if (loading) return <div className="skeleton h-9 w-48 rounded-xl" />;
-  if (devices.length <= 1) return null;
+  if (devices.length === 0) return null;
 
   return (
     <div className="relative">
@@ -70,6 +75,11 @@ export default function DeviceSelector({ value, onChange }: DeviceSelectorProps)
                       {d.name}
                     </p>
                     <div className="flex items-center gap-3 mt-0.5">
+                      {d.tenant && (
+                        <span className="text-[11px] text-[var(--text-tertiary)] flex items-center gap-1">
+                          <Building2 className="w-3 h-3" /> {d.tenant.name}
+                        </span>
+                      )}
                       <span className="text-[11px] text-[var(--text-tertiary)] flex items-center gap-1">
                         <Users className="w-3 h-3" /> {d.activeCount}/{d.customerCount} pelanggan
                       </span>

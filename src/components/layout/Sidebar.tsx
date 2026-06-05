@@ -20,19 +20,22 @@ import {
   X,
   BarChart3,
   CreditCard,
+  Network,
+  Building2,
 } from "lucide-react";
 import ThemeToggle from "@/components/ThemeToggle";
 
 
 const navItems = [
-  { href: "/", label: "Dashboard", icon: LayoutDashboard, roles: ["admin", "teknisi"] },
-  { href: "/clients", label: "Status Client", icon: Wifi, roles: ["admin", "teknisi"] },
-  { href: "/mrtg", label: "WAN Traffic", icon: BarChart3, roles: ["admin", "teknisi"] },
-  { href: "/devices", label: "Devices", icon: Server, roles: ["admin"] },
-  { href: "/traffic", label: "Traffic", icon: Activity, roles: ["admin", "teknisi"] },
-  { href: "/billing", label: "Billing", icon: CreditCard, roles: ["admin", "admin_pembayaran"] },
-  { href: "/alerts", label: "Alerts", icon: Bell, roles: ["admin", "teknisi"] },
-  { href: "/settings", label: "Settings", icon: Settings, roles: ["admin", "teknisi"] },
+  { href: "/", label: "Dashboard", icon: LayoutDashboard, roles: ["superadmin", "admin", "staff"] },
+  { href: "/clients", label: "Status Client", icon: Wifi, roles: ["superadmin", "admin", "staff"] },
+  { href: "/mrtg", label: "WAN Traffic", icon: BarChart3, roles: ["superadmin", "admin", "staff"] },
+  { href: "/routers", label: "Routers", icon: Network, roles: ["superadmin", "admin"] },
+  { href: "/traffic", label: "Traffic", icon: Activity, roles: ["superadmin", "admin", "staff"] },
+  { href: "/billing", label: "Billing", icon: CreditCard, roles: ["superadmin", "admin", "staff"] },
+  { href: "/tenants", label: "Tenants", icon: Building2, roles: ["superadmin"] },
+  { href: "/alerts", label: "Alerts", icon: Bell, roles: ["superadmin", "admin", "staff"] },
+  { href: "/settings", label: "Settings", icon: Settings, roles: ["superadmin", "admin", "staff"] },
 ];
 
 export function Sidebar() {
@@ -47,7 +50,7 @@ export function Sidebar() {
     return () => { document.body.style.overflow = ""; };
   }, [open]);
 
-  // Fetch devices for Quick Status
+  // Fetch devices for Quick Status (cleanup properly)
   useEffect(() => {
     const fetchDevices = () => {
       MikrotikAPI.getDevices()
@@ -66,7 +69,7 @@ export function Sidebar() {
   const displayEmail = user?.username ? `${user.username}@amanna` : "admin@amanna";
   const initials = displayName.charAt(0).toUpperCase();
   const userRole = user?.role || "admin";
-  const roleLabel = userRole === "admin" ? "Administrator" : userRole === "teknisi" ? "Teknisi" : "Admin Pembayaran";
+  const roleLabel = userRole === "superadmin" ? "Super Admin" : userRole === "admin" ? "Administrator" : "Staff";
 
   // Filter nav items by role
   const filteredNavItems = navItems.filter(item => item.roles.includes(userRole));
@@ -129,7 +132,9 @@ export function Sidebar() {
         {/* Nav */}
         <nav className="flex-1 px-3 space-y-0.5 overflow-y-auto">
           {filteredNavItems.map((item) => {
-            const active = pathname === item.href || (item.href !== "/" && pathname.startsWith(item.href));
+            const active = item.href === "/"
+              ? pathname === "/"
+              : pathname === item.href || pathname.startsWith(item.href + "/");
             return (
               <Link key={item.href} href={item.href} className={cn("nav-link", active && "active")}>
                 <item.icon className="w-[18px] h-[18px]" />
@@ -172,9 +177,10 @@ export function Sidebar() {
 
         {/* User */}
         <div className="px-3 pb-4">
-          <div
+          <button
             onClick={() => logout()}
-            className="flex items-center gap-3 px-3 py-2.5 rounded-xl hover:bg-[var(--bg-hover)] transition-colors cursor-pointer"
+            aria-label="Logout"
+            className="flex items-center gap-3 px-3 py-2.5 rounded-xl hover:bg-[var(--bg-hover)] transition-colors cursor-pointer w-full text-left"
           >
             <div className="w-9 h-9 rounded-full bg-gradient-to-br from-[var(--blue)] to-[var(--purple)] flex items-center justify-center">
               <span className="text-[13px] font-bold text-white">{initials}</span>
@@ -184,7 +190,7 @@ export function Sidebar() {
               <p className="text-[11px] text-[var(--text-tertiary)]">{roleLabel}</p>
             </div>
             <LogOut className="w-4 h-4 text-[var(--text-tertiary)]" />
-          </div>
+          </button>
         </div>
       </aside>
     </>

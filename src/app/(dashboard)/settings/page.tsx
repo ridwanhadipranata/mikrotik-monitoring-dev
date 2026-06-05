@@ -25,6 +25,13 @@ export default function SettingsPage() {
       <Header title="Settings" subtitle="Configure your monitoring dashboard" />
 
       <div className="p-4 md:p-6">
+        {/* Coming Soon Notice */}
+        <div className="card p-4 bg-[var(--blue-soft)] border-[var(--blue)]/20 mb-6">
+          <p className="text-[13px] text-[var(--blue)] font-medium">
+            ⚙️ Pengaturan sistem sedang dalam pengembangan. Saat ini menampilkan demo.
+          </p>
+        </div>
+
         {/* User Management Card (Admin Only) */}
         <Link href="/settings/users" className="card p-5 flex items-center gap-4 mb-6 hover:bg-[var(--bg-hover)] transition-colors">
           <div className="w-12 h-12 rounded-[14px] bg-[var(--blue-soft)] flex items-center justify-center">
@@ -39,7 +46,7 @@ export default function SettingsPage() {
 
         <div className="flex flex-col md:flex-row gap-6">
           {/* Sidebar Tabs */}
-          <div className="md:w-[200px] flex md:flex-row md:flex-col gap-1 overflow-x-auto md:overflow-visible">
+          <div className="md:w-[200px] flex flex-row md:flex-col gap-1 overflow-x-auto md:overflow-visible shrink-0">
             {tabs.map((tab) => (
               <button
                 key={tab.id}
@@ -56,7 +63,7 @@ export default function SettingsPage() {
           </div>
 
           {/* Content */}
-          <div className="flex-1 max-w-2xl">
+          <div className="flex-1 min-w-0">
             {activeTab === "general" && (
               <div className="space-y-6 animate-fade-in">
                 <Section title="Polling">
@@ -204,9 +211,14 @@ function InputField({ label, placeholder, suffix, defaultValue, type = "text" }:
     <div>
       <label className="block text-[13px] font-medium text-[var(--text-secondary)] mb-1.5">{label}</label>
       <div className="relative">
-        <input type={type} placeholder={placeholder} defaultValue={defaultValue} />
+        <input
+          type={type}
+          placeholder={placeholder}
+          defaultValue={defaultValue}
+          className={suffix ? "pr-12" : ""}
+        />
         {suffix && (
-          <span className="absolute right-3 top-1/2 -translate-y-1/2 text-[12px] text-[var(--text-tertiary)]">
+          <span className="absolute right-3 top-1/2 -translate-y-1/2 text-[12px] text-[var(--text-tertiary)] pointer-events-none">
             {suffix}
           </span>
         )}

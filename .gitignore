@@ -51,3 +51,23 @@ next-env.d.ts
 ecosystem.config.js
 AGENTS.md
 CLAUDE.md
+
+/src/generated/prisma
+
+# Database
+*.db
+*.db-journal
+
+# Environment
+.env
+.env.local
+.env.production
+
+# Data files
+data/
+wa-auth/
+
+# Audit reports
+AUDIT-*.md
+AUDIT-*.pdf
+generate-pdf.js

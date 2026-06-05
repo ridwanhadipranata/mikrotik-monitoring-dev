@@ -1,8 +1,8 @@
 "use client";
 
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { getStoredUser } from "@/lib/auth";
+import { getStoredUser, type AuthUser } from "@/lib/auth";
 
 interface Props {
   children: React.ReactNode;
@@ -12,15 +12,20 @@ interface Props {
 
 export default function RoleGuard({ children, allowedRoles, fallback = "/" }: Props) {
   const router = useRouter();
+  const [user, setUser] = useState<AuthUser | null>(null);
+  const [checked, setChecked] = useState(false);
 
   useEffect(() => {
-    const user = getStoredUser();
-    if (!user || !allowedRoles.includes(user.role)) {
+    const u = getStoredUser();
+    setUser(u);
+    if (!u || !allowedRoles.includes(u.role)) {
       router.replace(fallback);
     }
+    setChecked(true);
   }, [allowedRoles, fallback, router]);
 
-  const user = getStoredUser();
+  if (!checked) return null; // Loading state while checking
+
   if (!user || !allowedRoles.includes(user.role)) {
     return (
       <div className="flex items-center justify-center h-screen">

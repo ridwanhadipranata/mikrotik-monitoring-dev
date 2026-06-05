@@ -9,7 +9,7 @@ export default function BillingLayout({ children }: { children: React.ReactNode 
   return (
     <AuthProvider>
       <AuthGuard>
-        <RoleGuard allowedRoles={["admin", "admin_pembayaran"]} fallback="/">
+        <RoleGuard allowedRoles={["superadmin", "admin", "admin_pembayaran"]} fallback="/">
           <div className="min-h-screen bg-[var(--bg-base)]">
             <Sidebar />
             <main

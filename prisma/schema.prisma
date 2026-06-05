@@ -1,0 +1,140 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+// ═══════════════════════════════════════════════════════════════
+// MULTI-TENANT MODELS
+// ═══════════════════════════════════════════════════════════════
+
+model Tenant {
+  id          String   @id @default(cuid())
+  name        String
+  slug        String   @unique
+  description String?
+  waNumber    String?  // WhatsApp number for this tenant
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  users     User[]
+  routers   Router[]
+  packages  Package[]
+  customers Customer[]
+  invoices  Invoice[]
+}
+
+model User {
+  id           String   @id @default(cuid())
+  tenantId     String
+  username     String   @unique
+  passwordHash String
+  role         String   @default("staff") // superadmin, admin, staff
+  displayName  String
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+}
+
+model Router {
+  id           String   @id @default(cuid())
+  tenantId     String
+  name         String
+  host         String
+  port         Int      @default(8728)
+  user         String   @default("admin")
+  password     String   // encrypted
+  wanInterface String?
+  timeout      Int      @default(20)
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  tenant    Tenant     @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  customers Customer[]
+  invoices  Invoice[]
+  packages  Package[]
+
+  @@index([tenantId])
+}
+
+model Package {
+  id          String   @id @default(cuid())
+  tenantId    String
+  routerId    String?
+  name        String
+  speedUp     String?
+  speedDown   String?
+  price       Int
+  description String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  tenant    Tenant     @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  router    Router?    @relation(fields: [routerId], references: [id], onDelete: SetNull)
+  customers Customer[]
+
+  @@index([tenantId])
+  @@index([routerId])
+}
+
+model Customer {
+  id          String   @id @default(cuid())
+  tenantId    String
+  routerId    String
+  packageId   String
+  name        String
+  address     String?
+  phone       String?
+  simpleQueue String
+  billingDay  Int      @default(1)
+  status      String   @default("active") // active, inactive, suspended
+  installDate String?
+  lat         Float?
+  lng         Float?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  tenant   Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  router   Router    @relation(fields: [routerId], references: [id], onDelete: Cascade)
+  package  Package   @relation(fields: [packageId], references: [id], onDelete: Cascade)
+  invoices Invoice[]
+
+  @@unique([routerId, simpleQueue])
+  @@index([tenantId])
+  @@index([routerId])
+}
+
+model Invoice {
+  id          String    @id @default(cuid())
+  tenantId    String
+  routerId    String
+  customerId  String
+  month       Int
+  year        Int
+  amount      Int
+  ppn         Int       @default(0)
+  discount    Int       @default(0)
+  totalAmount Int
+  status      String    @default("unpaid") // unpaid, paid, cancelled
+  dueDate     String?
+  paidDate    String?
+  notes       String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  tenant   Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  router   Router   @relation(fields: [routerId], references: [id], onDelete: Cascade)
+  customer Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  @@unique([customerId, month, year])
+  @@index([tenantId])
+  @@index([routerId])
+  @@index([customerId])
+}
